@@ -18,6 +18,25 @@ if getattr(sys, "frozen", False):
 else:
     _BASE_DIR = Path(__file__).resolve().parent
 
+# --------------- 资源目录解析 ---------------
+# PyInstaller 单文件模式（onefile）下，datas 会解包到临时目录 sys._MEIPASS；
+# onedir / 源码模式下资源就在项目 assets 目录。两者都探测，保证任意打包方式都能加载。
+if getattr(sys, "frozen", False):
+    _ASSET_DIRS = [
+        Path(getattr(sys, "_MEIPASS", "")) / "assets",
+        _BASE_DIR / "assets",
+    ]
+else:
+    _ASSET_DIRS = [_BASE_DIR / "assets"]
+
+
+def _find_asset(filename: str):
+    for d in _ASSET_DIRS:
+        p = d / filename
+        if p.exists():
+            return p
+    return None
+
 LOG_DIR = _BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -77,16 +96,16 @@ def main():
     app.setApplicationName("懒人解压😋")
 
     # ---------- 加载全局样式 (QSS) ----------
-    qss_path = _BASE_DIR / "assets" / "style.qss"
-    if qss_path.exists():
+    qss_path = _find_asset("style.qss")
+    if qss_path is not None:
         app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
         logger.info(f"QSS 样式表已加载: {qss_path}")
     else:
-        logger.warning(f"未找到 QSS 样式表，使用默认外观: {qss_path}")
+        logger.warning("未找到 QSS 样式表，使用默认外观")
 
     # ---------- 设置应用图标 ----------
-    icon_path = _BASE_DIR / "assets" / "app_icon.png"
-    if icon_path.exists():
+    icon_path = _find_asset("app_icon.png")
+    if icon_path is not None:
         app.setWindowIcon(QIcon(str(icon_path)))
         logger.info(f"应用图标已加载: {icon_path}")
 
