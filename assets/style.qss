@@ -1,0 +1,287 @@
+/* ============================================================
+   懒人解压 - 全局样式表 (style.qss)
+   主题：暖心快递箱 · Light
+   ------------------------------------------------------------
+   设计令牌（Design Tokens）
+   --window-bg    #F3F6FA   窗口底色（冷灰蓝）
+   --surface      #FFFFFF   卡片 / 控件表面
+   --border       #E3E9F1   卡片描边
+   --border-strong #D6DEE9  控件描边
+   --ink          #1F2A3D   主文字（深石板灰）
+   --ink-2        #64748B   次要文字
+   --accent       #F97316   主题橙（快递箱 / 打包意象）
+   --accent-hover #EA580C   悬停橙
+   --accent-press #C2410C   按下橙
+   --success      #16A34A   成功
+   --error        #DC2626   失败
+   --info         #2563EB   进行中
+   --warn         #B45309   验证密码 / 跳过
+   ============================================================ */
+
+* {
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    font-size: 13px;
+    color: #1F2A3D;
+}
+
+/* ---------- 窗口 ---------- */
+QMainWindow,
+QDialog {
+    background-color: #F3F6FA;
+}
+
+/* 滚动区域保持透明，避免视口垫出底色块 */
+QScrollArea {
+    background-color: transparent;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background-color: transparent;
+}
+
+/* ---------- 卡片分组 ---------- */
+QGroupBox {
+    background-color: #FFFFFF;
+    border: 1px solid #E3E9F1;
+    border-radius: 10px;
+    margin-top: 14px;
+    padding: 8px 10px 10px 10px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 4px;
+    color: #334155;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+/* ---------- 拖拽放置区（签名元素） ---------- */
+QGroupBox#DropZone {
+    background-color: #FFFFFF;
+    border: 2px dashed #C7D2DF;
+    border-radius: 12px;
+    margin-top: 14px;
+    padding: 4px 10px 8px 10px;
+}
+
+QGroupBox#DropZone::title {
+    color: #EA580C;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+QGroupBox#DropZone QLabel {
+    color: #7A8798;
+    font-size: 14px;
+}
+
+QGroupBox#DropZone[drag_active="true"] {
+    background-color: #FFF6EC;
+    border: 2px solid #F97316;
+}
+
+QGroupBox#DropZone[drag_active="true"]::title {
+    color: #C2410C;
+}
+
+QGroupBox#DropZone[drag_active="true"] QLabel {
+    color: #C2410C;
+    font-weight: 600;
+}
+
+/* ---------- 按钮 ---------- */
+QPushButton {
+    background-color: #FFFFFF;
+    border: 1px solid #D6DEE9;
+    border-radius: 8px;
+    padding: 6px 14px;
+    color: #334155;
+}
+
+QPushButton:hover {
+    background-color: #FFF4E8;
+    border-color: #F97316;
+    color: #C2410C;
+}
+
+QPushButton:pressed {
+    background-color: #FFE8D2;
+    border-color: #EA580C;
+}
+
+QPushButton:disabled {
+    background-color: #F1F5F9;
+    border-color: #E4E9F0;
+    color: #9AA6B5;
+}
+
+/* 对话框按钮区中的默认按钮（确定/保存）使用主题橙 */
+QDialogButtonBox QPushButton:default {
+    background-color: #F97316;
+    border-color: #F97316;
+    color: #FFFFFF;
+    font-weight: 600;
+}
+
+QDialogButtonBox QPushButton:default:hover {
+    background-color: #EA580C;
+    border-color: #EA580C;
+    color: #FFFFFF;
+}
+
+QDialogButtonBox QPushButton:default:pressed {
+    background-color: #C2410C;
+    border-color: #C2410C;
+    color: #FFFFFF;
+}
+
+/* ---------- 输入控件 ---------- */
+QLineEdit,
+QSpinBox {
+    background-color: #FFFFFF;
+    border: 1px solid #D6DEE9;
+    border-radius: 6px;
+    padding: 5px 8px;
+    selection-background-color: #FFD9B3;
+}
+
+QLineEdit:focus,
+QSpinBox:focus {
+    border: 1px solid #F97316;
+}
+
+QLineEdit:read-only {
+    background-color: #F8FAFC;
+    color: #64748B;
+}
+
+QLineEdit:disabled {
+    background-color: #F1F5F9;
+    color: #9AA6B5;
+}
+
+/* ---------- 单选框 ---------- */
+QRadioButton {
+    spacing: 7px;
+    color: #334155;
+}
+
+QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 9px;
+    border: 2px solid #C7D0DB;
+    background-color: #FFFFFF;
+}
+
+QRadioButton::indicator:hover {
+    border-color: #F97316;
+}
+
+QRadioButton::indicator:checked {
+    background-color: #F97316;
+    border-color: #F97316;
+}
+
+/* ---------- 表格 ---------- */
+QTableWidget {
+    background-color: #FFFFFF;
+    alternate-background-color: #F7FAFD;
+    border: 1px solid #E3E9F1;
+    border-radius: 8px;
+    selection-background-color: #FFE7CF;
+    selection-color: #1F2A3D;
+    gridline-color: #EDF1F6;
+}
+
+QTableWidget::item {
+    padding: 4px 8px;
+    border: none;
+}
+
+QHeaderView::section {
+    background-color: #F0F4F9;
+    color: #4B5A6E;
+    border: none;
+    border-bottom: 1px solid #D9E2EC;
+    padding: 8px 8px;
+    font-weight: 600;
+}
+
+QTableCornerButton::section {
+    background-color: #F0F4F9;
+    border: none;
+    border-bottom: 1px solid #D9E2EC;
+}
+
+/* ---------- 滚动条 ---------- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: #CBD5E1;
+    border-radius: 4px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #94A3B8;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #CBD5E1;
+    border-radius: 4px;
+    min-width: 30px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #94A3B8;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: transparent;
+}
+
+/* ---------- 提示气泡 ---------- */
+QToolTip {
+    background-color: #1F2A3D;
+    color: #FFFFFF;
+    border: none;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+}
+
+/* ---------- 对话框文本 ---------- */
+QMessageBox QLabel {
+    color: #1F2A3D;
+}

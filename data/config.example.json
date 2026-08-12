@@ -1,0 +1,11 @@
+{
+  "engine": "winrar",
+  "output_mode": "source_directory",
+  "custom_output_path": "",
+  "max_workers": 4,
+  "max_scan_depth": 5,
+  "min_file_size_mb": 50,
+  "default_engine": "winrar",
+  "bandizip_path": "",
+  "winrar_path": ""
+}
