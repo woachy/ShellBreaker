@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.engine import WinRAREngine, WINRAR_PATHS, UNRAR_PATHS
 from core.exceptions import PasswordRequiredError, WrongPasswordError
+from data.config_manager import ConfigManager
 
 
 def _find_winrar_executable() -> str | None:
@@ -46,6 +47,12 @@ class TestWinRAREngineSilent(unittest.TestCase):
         cls.secret_content = "SuperSecretPayloadData_2026"
         cls.archive_password = "TestPassword123"
 
+        cls.cfg = ConfigManager()
+        cls._orig_output_mode = cls.cfg.get("output_mode")
+        cls._orig_custom_path = cls.cfg.get("custom_output_path")
+        cls.cfg.set("output_mode", "source_directory")
+        cls.cfg.set("custom_output_path", str(cls.test_dir))
+
         # 准备待压缩的测试源文件
         src_file = cls.test_dir / "secret.txt"
         src_file.write_text(cls.secret_content, encoding="utf-8")
@@ -69,6 +76,8 @@ class TestWinRAREngineSilent(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        cls.cfg.set("output_mode", cls._orig_output_mode)
+        cls.cfg.set("custom_output_path", cls._orig_custom_path)
         if cls.test_dir.exists():
             shutil.rmtree(cls.test_dir, ignore_errors=True)
 

@@ -44,6 +44,7 @@ class TestNestingLayers(unittest.TestCase):
         self._orig_output_mode = self.cfg.get("output_mode")
         self._orig_custom_path = self.cfg.get("custom_output_path")
         self.cfg.set("output_mode", "source_directory")
+        self.cfg.set("custom_output_path", str(self.test_dir))
 
         self.queue = TaskQueue()
         self.queue._ensure_engine()
