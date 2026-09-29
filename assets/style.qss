@@ -93,6 +93,28 @@ QGroupBox#DropZone[drag_active="true"] QLabel {
     font-weight: 600;
 }
 
+QGroupBox#DropZone QPushButton {
+    background-color: #F8FAFC;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 5px 14px;
+    font-size: 12px;
+    color: #334155;
+    font-weight: 500;
+}
+
+QGroupBox#DropZone QPushButton:hover {
+    background-color: #FFF7ED;
+    border-color: #F97316;
+    color: #EA580C;
+}
+
+QGroupBox#DropZone QPushButton:pressed {
+    background-color: #FFEDD5;
+    border-color: #C2410C;
+    color: #C2410C;
+}
+
 /* ---------- 按钮 ---------- */
 QPushButton {
     background-color: #FFFFFF;
@@ -203,6 +225,15 @@ QTableWidget::item {
     border: none;
 }
 
+QTableWidget::item:hover {
+    background-color: #FFF8F1;
+}
+
+QTableWidget::item:selected {
+    background-color: #FFE5CC;
+    color: #1F2A3D;
+}
+
 QHeaderView::section {
     background-color: #F0F4F9;
     color: #4B5A6E;
@@ -285,3 +316,70 @@ QToolTip {
 QMessageBox QLabel {
     color: #1F2A3D;
 }
+
+/* ---------- 底部状态统计栏 ---------- */
+QWidget#StatBar {
+    background-color: #FFFFFF;
+    border: 1px solid #E3E9F1;
+    border-radius: 8px;
+    padding: 3px 12px;
+}
+
+QLabel#lblStats {
+    font-size: 13px;
+    color: #334155;
+    font-weight: 500;
+}
+
+QPushButton#btnCleanFinished {
+    background-color: #F8FAFC;
+    border: 1px solid #D6DEE9;
+    border-radius: 6px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: #475569;
+}
+
+QPushButton#btnCleanFinished:hover {
+    background-color: #FFF4E8;
+    border-color: #F97316;
+    color: #C2410C;
+}
+
+QPushButton#btnCleanFinished:pressed {
+    background-color: #FFE8D2;
+    border-color: #EA580C;
+    color: #C2410C;
+}
+
+/* ---------- 快捷菜单 (QMenu) ---------- */
+QMenu {
+    background-color: #FFFFFF;
+    border: 1px solid #D6DEE9;
+    border-radius: 8px;
+    padding: 4px 0px;
+}
+
+QMenu::item {
+    padding: 7px 22px 7px 16px;
+    background-color: transparent;
+    color: #1F2A3D;
+    font-size: 13px;
+}
+
+QMenu::item:selected {
+    background-color: #FFF4E8;
+    color: #C2410C;
+}
+
+QMenu::item:disabled {
+    color: #94A3B8;
+    background-color: transparent;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: #E2E8F0;
+    margin: 4px 8px;
+}
+

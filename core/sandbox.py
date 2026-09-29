@@ -3,6 +3,7 @@
 每个解压任务在专属沙箱中执行，伪装包必须 shutil.copy() 实体重命名。
 阶段 4.7：新增 deliver_to_target() 搬运交付 + cleanup_sandbox() 回收。
 """
+import os
 import shutil
 import logging
 import re
@@ -30,18 +31,30 @@ KNOWN_ARCHIVE_EXTS = {
 PART_PATTERN = re.compile(r"^(.*)\.part(\d+)\.rar$", re.IGNORECASE)
 
 
-def _ensure_unique_path(target: Path) -> Path:
-    """若 target 已存在，自动追加 _1, _2 ... 序号直到找到空闲路径。"""
+def ensure_unique_path(target: Path) -> Path:
+    """若 target 已存在，自动追加 _1, _2 ... 序号直到找到空闲路径（保留文件扩展名）。"""
     if not target.exists():
         return target
     parent = target.parent
-    stem = target.stem
     counter = 1
-    while True:
-        candidate = parent / f"{stem}_{counter}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    if target.is_dir() or not target.suffix:
+        base_name = target.name
+        while True:
+            candidate = parent / f"{base_name}_{counter}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+    else:
+        stem = target.stem
+        suffix = target.suffix
+        while True:
+            candidate = parent / f"{stem}_{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+
+_ensure_unique_path = ensure_unique_path
 
 
 class SandboxManager:
@@ -99,6 +112,47 @@ class SandboxManager:
         shutil.copy(src, dest)
         return dest
 
+    # ---------- 暂存目录解套与清理 ----------
+
+    @staticmethod
+    def unwrap_temp_dirs(root_dir: Path) -> None:
+        """
+        清理或解套所有残留的以 _tmp_ 开头的临时目录。
+        自底向上（按路径层级由深到浅）遍历：
+        - 若为空目录，直接删除；
+        - 若非空，将其所有子项原子上移至其 parent 目录（重名追加序号），再删除该空目录。
+        """
+        if not root_dir.exists() or not root_dir.is_dir():
+            return
+
+        tmp_dirs = []
+        for dirpath, dirnames, _ in os.walk(str(root_dir)):
+            for d in dirnames:
+                if d.startswith("_tmp_"):
+                    tmp_dirs.append(Path(dirpath) / d)
+
+        # 按层级深度从深到浅排序，优先处理最内层的 _tmp_
+        tmp_dirs.sort(key=lambda p: len(p.parts), reverse=True)
+
+        for tmp_dir in tmp_dirs:
+            if not tmp_dir.exists() or not tmp_dir.is_dir():
+                continue
+            parent = tmp_dir.parent
+            # 移动所有子项到 parent
+            for item in list(tmp_dir.iterdir()):
+                dest = ensure_unique_path(parent / item.name)
+                try:
+                    shutil.move(str(item), str(dest))
+                    logger.debug(f"解套 _tmp_ 残留: {item} → {dest}")
+                except Exception as e:
+                    logger.warning(f"解套 _tmp_ 移动失败 ({item} → {dest}): {e}")
+            # 删除空的 _tmp_ 目录
+            try:
+                shutil.rmtree(str(tmp_dir), ignore_errors=True)
+                logger.info(f"提权：已清理暂存目录 '{tmp_dir.name}'")
+            except OSError as e:
+                logger.warning(f"清理暂存目录失败 ({tmp_dir}): {e}")
+
     # ---------- 搬运交付（阶段 4.7）----------
 
     @staticmethod
@@ -115,6 +169,9 @@ class SandboxManager:
         if not output_dir.exists() or not any(output_dir.iterdir()):
             raise SandboxError(f"沙箱 output 目录为空: {output_dir}")
 
+        # 确保送入 deliver_to_target 的只有干净的业务内容（最后防线）
+        SandboxManager.unwrap_temp_dirs(output_dir)
+
         cfg = ConfigManager()
         output_mode = cfg.get("output_mode", "source_directory")
         custom_path = cfg.get("custom_output_path", "")
@@ -122,12 +179,14 @@ class SandboxManager:
         target_root = Path(custom_path) if (output_mode == "custom" and custom_path) else src.parent
         target_base = target_root / src.stem
 
-        final_target = _ensure_unique_path(target_base)
+        final_target = ensure_unique_path(target_base)
         final_target.mkdir(parents=True, exist_ok=True)
 
         count = 0
         for item in output_dir.iterdir():
-            dest = final_target / item.name
+            if item.name in SandboxManager._SYSTEM_FILES:
+                continue
+            dest = ensure_unique_path(final_target / item.name)
             shutil.move(str(item), str(dest))
             count += 1
             logger.debug(f"搬运: {item.name} → {dest}")
@@ -142,21 +201,18 @@ class SandboxManager:
     @staticmethod
     def promote_content(output_dir: Path) -> None:
         """
-        【原子搬运阶段】— 简单物理搬运，零破坏原则。
-
-        —— 仅基于 output 根目录的 os.listdir() 做表面判断 ——
-        1. 清理系统隐藏文件
-        2. output 根目录恰好只有 1 个目录 → Data Body 已就位，等待 deliver_to_target
-        3. output 根目录有 0 个或多于 1 个条目 → 保持现状
-
-        【绝对红线】
-        - 绝不递归扫描 Data Body 内部（禁止 rglob / riterdir）
-        - 绝不对目录内部做任何拆解或移动（禁止拍平）
-        - Data Body 是什么层级就保持什么层级，作为原子单位交付
+        【容器提权阶段】
+        1. 清理或解套所有残留的 _tmp_ 目录，消除中间包装壳。
+        2. 清理系统隐藏文件 (.DS_Store 等)。
+        3. 回收空壳目录。
         """
         if not output_dir.exists() or not output_dir.is_dir():
             return
 
+        # 第一步：解套并清理所有残留的 _tmp_ 目录
+        SandboxManager.unwrap_temp_dirs(output_dir)
+
+        # 第二步：清理系统文件
         for entry in list(output_dir.iterdir()):
             if entry.name in SandboxManager._SYSTEM_FILES and entry.is_file():
                 try:
@@ -165,35 +221,10 @@ class SandboxManager:
                 except OSError:
                     pass
 
-        entries = [
-            e for e in output_dir.iterdir()
-            if e.name not in SandboxManager._SYSTEM_FILES
-        ]
-
-        if len(entries) != 1:
-            logger.info(
-                f"提权：output 根目录有 {len(entries)} 个条目，"
-                f"保持现状（不做搬运，保护多文件结构完整性）"
-            )
-            return
-
-        sole = entries[0]
-        if not sole.is_dir():
-            logger.info(
-                f"提权：output 根目录唯一条目为文件 '{sole.name}'，"
-                f"保持现状（不搬运单文件）"
-            )
-            return
-
-        logger.info(
-            f"提权：Data Body 确认为 '{sole.name}'，"
-            f"目录层级保持完整，等待 deliver_to_target 原子搬运"
-        )
-
+        # 第三步：回收空壳目录
         for entry in list(output_dir.iterdir()):
             if (entry.is_dir()
-                    and entry.name not in SandboxManager._SYSTEM_FILES
-                    and entry != sole):
+                    and entry.name not in SandboxManager._SYSTEM_FILES):
                 try:
                     if not any(entry.iterdir()):
                         entry.rmdir()

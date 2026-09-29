@@ -19,7 +19,7 @@ from core.exceptions import (
     ExtractionFailedError,
     SandboxError,
 )
-from core.sandbox import SandboxManager
+from core.sandbox import SandboxManager, ensure_unique_path
 from core.engine import (
     EngineType,
     BaseEngine,
@@ -544,7 +544,7 @@ class TaskQueue(QObject):
     # ---------- 嵌套解压 ----------
 
     @staticmethod
-    def _has_archives(dir_path: Path) -> bool:
+    def _has_archives(dir_path: Path, exclude: Optional[set[Path]] = None) -> bool:
         """
         【停止判定】只检查 dir_path 的直接子项，
         禁止使用 rglob 递归扫描内部，保护 Data Body 不被穿透。
@@ -553,6 +553,8 @@ class TaskQueue(QObject):
             return False
         for entry in dir_path.iterdir():
             if entry.is_file() and entry.suffix.lower() in NESTED_ARCHIVE_EXTS:
+                if exclude and entry in exclude:
+                    continue
                 return True
         return False
 
@@ -565,80 +567,109 @@ class TaskQueue(QObject):
         self, task_id: str, sandbox_dir: Path, base_dest: str,
         passwords: list[str], depth: int,
     ):
-        if depth > MAX_NEST_DEPTH:
-            raise ZipBombDetectedError(str(sandbox_dir), depth)
-
         base = Path(base_dest)
-        if not base.exists():
+        if not base.exists() or not base.is_dir():
             return
 
-        # ===== 【停止判定】只检查当前层级，无压缩包则立即中断 =====
-        if not self._has_archives(base):
-            return
+        current_depth = depth
+        skipped_archives: set[Path] = set()
 
-        archives = [
-            child for child in base.iterdir()
-            if child.is_file() and child.suffix.lower() in NESTED_ARCHIVE_EXTS
-        ]
+        # ===== 【多层嵌套消化循环】在当前 base 目录下持续循环处理暴露出的压缩包 =====
+        while self._has_archives(base, skipped_archives):
+            if current_depth > MAX_NEST_DEPTH:
+                raise ZipBombDetectedError(str(sandbox_dir), current_depth)
 
-        for archive in archives:
-            if not archive.exists():
-                continue
+            archives = [
+                child for child in base.iterdir()
+                if child.is_file()
+                and child.suffix.lower() in NESTED_ARCHIVE_EXTS
+                and child not in skipped_archives
+            ]
 
-            self.task_progress.emit(task_id, f"处理嵌套压缩包 (层{depth}): {archive.name}")
-            parent_dir = archive.parent
-            temp_dest = parent_dir / f"_tmp_{archive.stem}"
+            if not archives:
+                break
 
-            ext = archive.suffix.lower()
-            rename_workaround = None
-            if ext not in {".zip", ".rar", ".7z"}:
-                rename_workaround = archive.with_suffix(".zip")
-                shutil.copy(archive, rename_workaround)
-                working_archive = rename_workaround
-                logger.info(f"[{task_id}] 嵌套伪装包重命名: {working_archive}")
-            else:
-                working_archive = archive
+            for archive in archives:
+                if not archive.exists():
+                    continue
 
-            try:
-                self._extract_with_passwords(task_id, working_archive, str(temp_dest), passwords)
-            except (PasswordRequiredError, WrongPasswordError):
-                logger.warning(f"[{task_id}] 嵌套包需密码，跳过: {archive.name}")
-                if rename_workaround and rename_workaround.exists():
-                    try: rename_workaround.unlink()
-                    except OSError: pass
-                if temp_dest.exists():
-                    shutil.rmtree(str(temp_dest), ignore_errors=True)
-                continue
-            except ExtractionFailedError as e:
-                logger.warning(f"[{task_id}] 嵌套解压失败: {archive.name} — {e}")
-                if rename_workaround and rename_workaround.exists():
-                    try: rename_workaround.unlink()
-                    except OSError: pass
-                if temp_dest.exists():
-                    shutil.rmtree(str(temp_dest), ignore_errors=True)
-                continue
+                self.task_progress.emit(task_id, f"处理嵌套压缩包 (层{current_depth}): {archive.name}")
+                parent_dir = archive.parent
+                temp_dest = parent_dir / f"_tmp_{archive.stem}"
 
-            # 安全删除中间压缩包
-            try:
-                archive.unlink()
-                logger.info(f"[{task_id}] 已删除中间压缩包: {archive.name}")
-            except OSError as e:
-                logger.warning(f"[{task_id}] 删除中间压缩包失败 ({archive.name}): {e}")
+                ext = archive.suffix.lower()
+                rename_workaround = None
+                if ext not in {".zip", ".rar", ".7z"}:
+                    rename_workaround = archive.with_suffix(".zip")
+                    shutil.copy(archive, rename_workaround)
+                    working_archive = rename_workaround
+                    logger.info(f"[{task_id}] 嵌套伪装包重命名: {working_archive}")
+                else:
+                    working_archive = archive
 
-            # 清理伪装修复文件
-            if rename_workaround and rename_workaround.exists():
                 try:
-                    rename_workaround.unlink()
-                except OSError:
-                    pass
+                    self._extract_with_passwords(task_id, working_archive, str(temp_dest), passwords)
+                except (PasswordRequiredError, WrongPasswordError):
+                    logger.warning(f"[{task_id}] 嵌套包需密码，跳过: {archive.name}")
+                    skipped_archives.add(archive)
+                    if rename_workaround and rename_workaround.exists():
+                        try:
+                            rename_workaround.unlink()
+                        except OSError:
+                            pass
+                    if temp_dest.exists():
+                        shutil.rmtree(str(temp_dest), ignore_errors=True)
+                    continue
+                except ExtractionFailedError as e:
+                    logger.warning(f"[{task_id}] 嵌套解压失败: {archive.name} — {e}")
+                    skipped_archives.add(archive)
+                    if rename_workaround and rename_workaround.exists():
+                        try:
+                            rename_workaround.unlink()
+                        except OSError:
+                            pass
+                    if temp_dest.exists():
+                        shutil.rmtree(str(temp_dest), ignore_errors=True)
+                    continue
 
-            # --- 【原子搬运红线】只删压缩包，不拆解 temp_dest 目录结构 ---
-            # temp_dest 内部层级原封不动保留，禁止 for child in ... 拍平
+                # 1. 安全删除中间压缩包
+                try:
+                    archive.unlink()
+                    logger.info(f"[{task_id}] 已删除中间压缩包: {archive.name}")
+                except OSError as e:
+                    logger.warning(f"[{task_id}] 删除中间压缩包失败 ({archive.name}): {e}")
+
+                # 2. 清理伪装修复文件
+                if rename_workaround and rename_workaround.exists():
+                    try:
+                        rename_workaround.unlink()
+                    except OSError:
+                        pass
+
+                # 3. 立即将 temp_dest 中的所有文件/子目录使用原子 move 上移到 parent_dir (重名防覆盖)
+                if temp_dest.exists():
+                    for item in list(temp_dest.iterdir()):
+                        dest = ensure_unique_path(parent_dir / item.name)
+                        try:
+                            shutil.move(str(item), str(dest))
+                            logger.debug(f"[{task_id}] 原子上移: {item.name} → {dest.name}")
+                        except Exception as e:
+                            logger.error(f"[{task_id}] 原子上移失败 ({item.name} → {dest.name}): {e}")
+                            raise SandboxError(f"原子上移文件失败: {e}")
+
+                    # 4. 上移完成后，彻底删除空的 temp_dest 目录
+                    try:
+                        shutil.rmtree(str(temp_dest), ignore_errors=True)
+                        logger.debug(f"[{task_id}] 已清除暂存目录: {temp_dest}")
+                    except OSError as e:
+                        logger.warning(f"[{task_id}] 删除暂存目录失败 ({temp_dest}): {e}")
+
+            current_depth += 1
 
         # ---- 递归进入子目录（逐个分支，不重复扫描 base_dest 根）-----
         for subdir in sorted(base.iterdir()):
             if subdir.is_dir():
-                self._extract_nested(task_id, sandbox_dir, str(subdir), passwords, depth + 1)
+                self._extract_nested(task_id, sandbox_dir, str(subdir), passwords, current_depth)
 
     def _on_task_done(self, future: Future):
         task_id = self._futures.pop(future, None)

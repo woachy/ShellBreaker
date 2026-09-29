@@ -218,6 +218,8 @@ class WinRAREngine(BaseEngine):
         pw_provided = bool(password)
         if password:
             cmd.insert(-2, f"-p{password}")
+        else:
+            cmd.insert(-2, "-p-")
 
         result = self._run_command(cmd, timeout)
 
@@ -241,9 +243,14 @@ class WinRAREngine(BaseEngine):
         """
         code = result.returncode
         if code == 11:
-            raise WrongPasswordError(
-                archive_str, password_used,
-                f"WinRAR exit code {code}: 密码错误 | {result.stderr or ''}")
+            if pw_provided:
+                raise WrongPasswordError(
+                    archive_str, password_used,
+                    f"WinRAR exit code {code}: 密码错误 | {result.stderr or ''}")
+            else:
+                raise PasswordRequiredError(
+                    archive_str,
+                    f"WinRAR exit code {code}: 压缩包已加密需要密码 | {result.stderr or ''}")
         if code == 1:
             logger.warning(
                 "WinRAR 警告 (exit=%d): %s | %s",
@@ -274,6 +281,10 @@ class WinRAREngine(BaseEngine):
             self.exe_path, "r", "-ibck", "-inul", "-y",
             archive_str, str(repaired_dir) + os.sep,
         ]
+        if password:
+            repair_cmd.insert(-2, f"-p{password}")
+        else:
+            repair_cmd.insert(-2, "-p-")
         logger.info(f"WinRAR 执行修复: {repair_cmd}")
         self._run_command(repair_cmd, timeout=min(timeout, 300))
 
