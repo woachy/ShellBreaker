@@ -27,8 +27,85 @@ KNOWN_ARCHIVE_EXTS = {
     ".arj", ".lzh", ".cab", ".iso", ".uue", ".z", ".001",
 }
 
+# 受保护的终点程序白名单：无论内部结构为何，绝对禁止当作压缩包拆解
+PROTECTED_ENDPOINT_EXTS = frozenset({".apk", ".exe", ".msi"})
+
+# 常见伪装后缀白名单
+POTENTIAL_DISGUISE_EXTS = frozenset({
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv",
+    ".pdf", ".bin", ".dat", ".iso", ".bak",
+})
+
+# 说明与元数据配件文件后缀（允许附带在大文件旁，不破坏孤儿形态）
+ACCESSORY_EXTS = frozenset({".txt", ".url", ".nfo", ".html", ".htm", ".md"})
+
 # 分卷正则
 PART_PATTERN = re.compile(r"^(.*)\.part(\d+)\.rar$", re.IGNORECASE)
+
+
+def detect_archive_type(file_path: str | Path) -> Optional[str]:
+    """
+    通过读取文件头部魔数（前 16 字节）检测真实压缩包类型。
+    若非压缩包（如真正的图片、视频）返回 None。
+    保护白名单 (.apk, .exe, .msi) 无论内部结构为何，绝不识别为压缩包。
+
+    魔数规范：
+    - ZIP: PK\\x03\\x04 / PK\\x05\\x06 / PK\\x07\\x08 或 zipfile.is_zipfile 兜底
+    - RAR: Rar!\\x1a\\x07 (RAR 4.x / 5.x)
+    - 7Z:  7z\\xbc\\xaf'\\x1c (0x37 0x7A 0xBC 0xAF 0x27 0x1C)
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        return None
+
+    ext = path.suffix.lower()
+    if ext in PROTECTED_ENDPOINT_EXTS:
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            header = f.read(16)
+    except OSError as e:
+        logger.warning(f"无法读取文件头部魔数 ({path}): {e}")
+        return None
+
+    if len(header) < 4:
+        return None
+
+    # 1. 7-Zip: 6 字节 -> 37 7A BC AF 27 1C
+    if header.startswith(b"\x37\x7a\xbc\xaf\x27\x1c"):
+        return ".7z"
+
+    # 2. RAR: 6 字节 -> 52 61 72 21 1A 07 (RAR 4.x / 5.x 均匹配)
+    if header.startswith(b"Rar!\x1a\x07"):
+        return ".rar"
+
+    # 3. ZIP: 4 字节 -> PK\x03\x04, PK\x05\x06, PK\x07\x08
+    if header.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return ".zip"
+
+    # 4. Gzip
+    if header.startswith(b"\x1f\x8b"):
+        return ".gz"
+
+    # 5. Bzip2
+    if header.startswith(b"BZh"):
+        return ".bz2"
+
+    # 6. XZ
+    if header.startswith(b"\xfd7zXZ\x00"):
+        return ".xz"
+
+    # 7. zipfile.is_zipfile 兜底验证 (尾部 central dir 或自解压结构)
+    try:
+        import zipfile
+        if zipfile.is_zipfile(path):
+            return ".zip"
+    except Exception:
+        pass
+
+    return None
 
 
 def ensure_unique_path(target: Path) -> Path:
@@ -99,6 +176,11 @@ class SandboxManager:
             raise SandboxError(f"源文件不存在: {src}")
 
         ext = src.suffix.lower()
+
+        # 终点白名单保护：.apk (及 .exe, .msi) 绝不作为压缩包拆解
+        if ext in PROTECTED_ENDPOINT_EXTS:
+            raise SandboxError(f"受保护的终点程序文件 ({ext})，禁止作为压缩包解压: {src.name}")
+
         is_known = ext in KNOWN_ARCHIVE_EXTS
         if PART_PATTERN.match(src.name):
             is_known = True
@@ -107,9 +189,19 @@ class SandboxManager:
             logger.debug(f"合法压缩包，无需重命名: {src}")
             return src
 
-        dest = sandbox / (src.stem + ".zip")
-        logger.info(f"检测到伪装包 ({ext})，shutil.copy → {dest}")
-        shutil.copy(src, dest)
+        # 顶层伪装包检测：魔数必须匹配压缩包
+        real_ext = detect_archive_type(src)
+        if not real_ext:
+            raise SandboxError(f"文件不是有效的压缩包格式 (魔数不匹配): {src.name}")
+
+        dest = sandbox / (src.stem + real_ext)
+        logger.info(f"检测到伪装包 ({ext} -> {real_ext})，准备进入沙箱 → {dest}")
+        try:
+            os.link(src, dest)
+            logger.debug(f"通过硬链接准备文件: {dest}")
+        except (OSError, AttributeError):
+            shutil.copy(src, dest)
+            logger.debug(f"通过复制准备文件: {dest}")
         return dest
 
     # ---------- 暂存目录解套与清理 ----------

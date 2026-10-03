@@ -19,7 +19,14 @@ from core.exceptions import (
     ExtractionFailedError,
     SandboxError,
 )
-from core.sandbox import SandboxManager, ensure_unique_path
+from core.sandbox import (
+    SandboxManager,
+    ensure_unique_path,
+    PROTECTED_ENDPOINT_EXTS,
+    POTENTIAL_DISGUISE_EXTS,
+    ACCESSORY_EXTS,
+    detect_archive_type,
+)
 from core.engine import (
     EngineType,
     BaseEngine,
@@ -448,6 +455,8 @@ class TaskQueue(QObject):
                 logger.info(f"[{task_id}] {label} 用户密码匹配成功")
                 self._pwd_mgr.reload()
                 self._pwd_mgr.add(user_pwd, "[自动入库]")
+                if user_pwd not in passwords:
+                    passwords.append(user_pwd)
                 self.task_progress.emit(task_id, "密码已自动入库 ✅")
                 return
             except WrongPasswordError:
@@ -505,6 +514,8 @@ class TaskQueue(QObject):
                 logger.info(f"[{task_id}] repair 用户密码匹配成功")
                 self._pwd_mgr.reload()
                 self._pwd_mgr.add(user_pwd, "[自动入库]")
+                if user_pwd not in passwords:
+                    passwords.append(user_pwd)
                 self.task_progress.emit(task_id, "密码已自动入库 ✅")
                 return
             except WrongPasswordError:
@@ -558,6 +569,99 @@ class TaskQueue(QObject):
                 return True
         return False
 
+    def _find_and_convert_disguised_archive(
+        self, base_dir: Path, skipped_archives: set[Path], task_id: str = "",
+    ) -> Optional[Path]:
+        """
+        形态驱动的伪装检测（精准狙击单一大文件伪装，绝对不碰多文件业务内容）：
+        1. 当 base 目录已经解压出子目录或多个文件（解包后的游戏/资源本体 Data Body）时：
+           仅处理标准的真实压缩包，绝不对散装的图片/视频文件进行伪装下钻，立即视为终点交付。
+        2. 当 base 目录仅包含“单个独立孤儿大文件”（或该大文件仅附带了 .txt, .url, .nfo 等说明文件）：
+           - 终点白名单保护：.apk (及 .exe, .msi) 无论内部结构为何，绝对禁止作为压缩包拆解；
+           - 检查伪装后缀及大小阈值 (配置 disguise_min_size_mb，默认 >= 10MB)；
+           - 验证前 16 字节魔数：匹配则原位重命名为对应真实后缀 (零物理复制开销)，返回重命名后的路径；不匹配则不碰。
+        """
+        if not base_dir.is_dir():
+            return None
+
+        # 1. 检查是否存在子目录 (Data Body 保护)
+        subdirs = [
+            e for e in base_dir.iterdir()
+            if e.is_dir()
+            and e.name not in SandboxManager._SYSTEM_FILES
+            and not e.name.startswith("._")
+            and not e.name.startswith("_tmp_")
+        ]
+        if subdirs:
+            logger.debug(f"[{task_id}] base 包含子目录，不满足单一大文件伪装形态: {[d.name for d in subdirs]}")
+            return None
+
+        # 2. 检查文件列表
+        all_files = [
+            e for e in base_dir.iterdir()
+            if e.is_file()
+            and e.name not in SandboxManager._SYSTEM_FILES
+            and not e.name.startswith("._")
+        ]
+
+        # 过滤掉说明/配件文件 (.txt, .url, .nfo 等)
+        non_accessory_files = [
+            f for f in all_files
+            if f.suffix.lower() not in ACCESSORY_EXTS
+        ]
+
+        # 必须是“单个独立孤儿大文件”形态
+        if len(non_accessory_files) != 1:
+            logger.debug(f"[{task_id}] base 包含 {len(non_accessory_files)} 个非说明文件，非孤儿大文件形态")
+            return None
+
+        candidate = non_accessory_files[0]
+
+        if candidate in skipped_archives:
+            return None
+
+        # 3. 终点白名单保护：.apk (及 .exe, .msi) 无论内部结构为何，绝对禁止拆解
+        if candidate.suffix.lower() in PROTECTED_ENDPOINT_EXTS:
+            logger.info(f"[{task_id}] 命中受保护终点白名单 ({candidate.suffix}): {candidate.name}，视为终点交付")
+            return None
+
+        # 4. 如果已经是标准压缩包，交给普通循环处理
+        if candidate.suffix.lower() in NESTED_ARCHIVE_EXTS:
+            return None
+
+        # 5. 后缀检查（.jpg, .png, .mp4, .pdf, .bin 等）
+        if candidate.suffix.lower() not in POTENTIAL_DISGUISE_EXTS:
+            logger.debug(f"[{task_id}] {candidate.name} 后缀不在伪装候选列表中")
+            return None
+
+        # 6. 大小阈值检查（如 > 10MB）
+        min_mb = int(self._config.get("disguise_min_size_mb", 10))
+        min_bytes = min_mb * 1024 * 1024
+        try:
+            size = candidate.stat().st_size
+        except OSError:
+            return None
+
+        if size < min_bytes:
+            logger.debug(f"[{task_id}] {candidate.name} 大小 ({size}B) 未达伪装阈值 ({min_bytes}B)")
+            return None
+
+        # 7. 验证前 16 字节魔数
+        real_ext = detect_archive_type(candidate)
+        if not real_ext:
+            logger.info(f"[{task_id}] {candidate.name} 魔数非压缩包（真实媒体/文档），视为终点交付")
+            return None
+
+        # 8. 魔数匹配：100% 确认伪装包！在沙箱内原位重命名为对应真实后缀 (零物理复制开销)
+        target_path = ensure_unique_path(candidate.with_suffix(real_ext))
+        try:
+            os.replace(candidate, target_path)
+            logger.info(f"[{task_id}] 命中单一大文件伪装: {candidate.name} -> 原位重命名为 {target_path.name}")
+            return target_path
+        except OSError as e:
+            logger.error(f"[{task_id}] 原位重命名失败 ({candidate} -> {target_path}): {e}")
+            return None
+
     def _extract_with_passwords(
         self, task_id: str, archive: Path, dest: str, passwords: list[str],
     ):
@@ -575,7 +679,7 @@ class TaskQueue(QObject):
         skipped_archives: set[Path] = set()
 
         # ===== 【多层嵌套消化循环】在当前 base 目录下持续循环处理暴露出的压缩包 =====
-        while self._has_archives(base, skipped_archives):
+        while True:
             if current_depth > MAX_NEST_DEPTH:
                 raise ZipBombDetectedError(str(sandbox_dir), current_depth)
 
@@ -587,7 +691,12 @@ class TaskQueue(QObject):
             ]
 
             if not archives:
-                break
+                # 检查是否存在单一大文件伪装包
+                disguised = self._find_and_convert_disguised_archive(base, skipped_archives, task_id)
+                if disguised:
+                    archives = [disguised]
+                else:
+                    break
 
             for archive in archives:
                 if not archive.exists():
@@ -595,39 +704,22 @@ class TaskQueue(QObject):
 
                 self.task_progress.emit(task_id, f"处理嵌套压缩包 (层{current_depth}): {archive.name}")
                 parent_dir = archive.parent
-                temp_dest = parent_dir / f"_tmp_{archive.stem}"
+                temp_dest = ensure_unique_path(parent_dir / f"_tmp_{archive.stem}")
 
-                ext = archive.suffix.lower()
-                rename_workaround = None
-                if ext not in {".zip", ".rar", ".7z"}:
-                    rename_workaround = archive.with_suffix(".zip")
-                    shutil.copy(archive, rename_workaround)
-                    working_archive = rename_workaround
-                    logger.info(f"[{task_id}] 嵌套伪装包重命名: {working_archive}")
-                else:
-                    working_archive = archive
+                # 此时 archive 已具备标准压缩包扩展名，在沙箱内无需任何 copy 重命名
+                working_archive = archive
 
                 try:
                     self._extract_with_passwords(task_id, working_archive, str(temp_dest), passwords)
                 except (PasswordRequiredError, WrongPasswordError):
-                    logger.warning(f"[{task_id}] 嵌套包需密码，跳过: {archive.name}")
+                    logger.warning(f"[{task_id}] 嵌套包需密码且用户未提供，跳过: {archive.name}")
                     skipped_archives.add(archive)
-                    if rename_workaround and rename_workaround.exists():
-                        try:
-                            rename_workaround.unlink()
-                        except OSError:
-                            pass
                     if temp_dest.exists():
                         shutil.rmtree(str(temp_dest), ignore_errors=True)
                     continue
                 except ExtractionFailedError as e:
                     logger.warning(f"[{task_id}] 嵌套解压失败: {archive.name} — {e}")
                     skipped_archives.add(archive)
-                    if rename_workaround and rename_workaround.exists():
-                        try:
-                            rename_workaround.unlink()
-                        except OSError:
-                            pass
                     if temp_dest.exists():
                         shutil.rmtree(str(temp_dest), ignore_errors=True)
                     continue
@@ -639,14 +731,7 @@ class TaskQueue(QObject):
                 except OSError as e:
                     logger.warning(f"[{task_id}] 删除中间压缩包失败 ({archive.name}): {e}")
 
-                # 2. 清理伪装修复文件
-                if rename_workaround and rename_workaround.exists():
-                    try:
-                        rename_workaround.unlink()
-                    except OSError:
-                        pass
-
-                # 3. 立即将 temp_dest 中的所有文件/子目录使用原子 move 上移到 parent_dir (重名防覆盖)
+                # 2. 立即将 temp_dest 中的所有文件/子目录使用原子 move 上移到 parent_dir (重名防覆盖)
                 if temp_dest.exists():
                     for item in list(temp_dest.iterdir()):
                         dest = ensure_unique_path(parent_dir / item.name)
@@ -657,7 +742,7 @@ class TaskQueue(QObject):
                             logger.error(f"[{task_id}] 原子上移失败 ({item.name} → {dest.name}): {e}")
                             raise SandboxError(f"原子上移文件失败: {e}")
 
-                    # 4. 上移完成后，彻底删除空的 temp_dest 目录
+                    # 3. 上移完成后，彻底删除空的 temp_dest 目录
                     try:
                         shutil.rmtree(str(temp_dest), ignore_errors=True)
                         logger.debug(f"[{task_id}] 已清除暂存目录: {temp_dest}")

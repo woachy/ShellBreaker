@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "max_workers": 2,
     "max_scan_depth": 4,               # 拖入文件夹时的最大递归扫描层数 (1-50)
     "min_file_size_mb": 50,            # 最小解压文件大小 (MB)，小于此值跳过
+    "disguise_min_size_mb": 10,        # 嵌套层伪装包最小识别大小 (MB)，默认 10MB
     "bandizip_path": "",               # bz.exe 绝对路径，空字符串=自动扫描
     "winrar_path": "",                 # WinRAR.exe 绝对路径，空字符串=自动扫描
 }

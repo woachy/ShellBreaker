@@ -39,7 +39,7 @@ from PySide6.QtGui import (
 )
 
 from core.task_queue import TaskQueue
-from core.sandbox import SandboxManager
+from core.sandbox import SandboxManager, PROTECTED_ENDPOINT_EXTS
 
 logger = logging.getLogger("ShellBreaker.MainWindow")
 
@@ -357,6 +357,18 @@ class MainWindow(QMainWindow):
                 "dest_path": "",
                 "remark": "",
             }
+
+            # 受保护终点程序检查 (.apk, .exe, .msi)
+            ext = os.path.splitext(clean_path)[1].lower()
+            if ext in PROTECTED_ENDPOINT_EXTS:
+                self._add_task_row(task_id, filename)
+                self._set_cell(self._task_rows[task_id], 1, "已跳过")
+                self._set_cell(self._task_rows[task_id], 3, f"受保护终点程序 ({ext})")
+                self._task_data[task_id]["status"] = "已跳过"
+                self._task_data[task_id]["remark"] = f"受保护终点程序 ({ext})"
+                self._update_statistics()
+                logger.info(f"终点白名单保护，跳过: {filename}")
+                return
 
             # 大小预检查
             if self._task_queue._is_file_too_small(clean_path):
