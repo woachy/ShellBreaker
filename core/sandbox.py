@@ -189,10 +189,9 @@ class SandboxManager:
             logger.debug(f"合法压缩包，无需重命名: {src}")
             return src
 
-        # 顶层伪装包检测：魔数必须匹配压缩包
-        real_ext = detect_archive_type(src)
-        if not real_ext:
-            raise SandboxError(f"文件不是有效的压缩包格式 (魔数不匹配): {src.name}")
+        # 伪装包处理：若魔数识别出具体格式则用对应后缀，
+        # 若魔数未识别（例如各类图种），直接默认使用 .zip 后缀，保持第一层容错解压能力
+        real_ext = detect_archive_type(src) or ".zip"
 
         dest = sandbox / (src.stem + real_ext)
         logger.info(f"检测到伪装包 ({ext} -> {real_ext})，准备进入沙箱 → {dest}")

@@ -75,18 +75,27 @@ class TestDisguiseAndWhitelist(unittest.TestCase):
 
     def test_case_1_nested_single_disguised_jpg_peeled_successfully(self):
         """
-        Case 1: 嵌套解压产出单个伪装成 .jpg 的压缩包（内部含游戏文件夹），
-        验证成功识别魔数、原位剥离外壳并最终解出游戏文件夹。
+        Case 1: 嵌套解压产出单个伪装成 .jpg 的压缩包（真实的“图种”：前 512 字节为 JPEG 头，后接 ZIP 包），
+        验证成功识别、试解压剥离外壳并最终解出游戏文件夹。
         """
-        # 1. 构造内部伪装包 game_disguised.jpg (实际是 ZIP，且体积 > 10MB)
+        # 1. 构造真实“图种” game_disguised.jpg (前 512 字节为 JPEG 头，后接 ZIP 包，体积 > 10MB)
         disguised_jpg = self.test_dir / "game_disguised.jpg"
         game_payload_text = "Executable binary data for Game.exe"
         # 写入 11MB 数据以达到并超过 10MB 伪装阈值
         dummy_large_data = b"X" * (11 * 1024 * 1024)
 
-        with zipfile.ZipFile(disguised_jpg, "w", zipfile.ZIP_STORED) as zf:
+        # 先构造内部标准 ZIP
+        raw_zip_path = self.test_dir / "temp_raw_payload.zip"
+        with zipfile.ZipFile(raw_zip_path, "w", zipfile.ZIP_STORED) as zf:
             zf.writestr("GameFolder/Game.exe", game_payload_text)
             zf.writestr("GameFolder/data.pak", dummy_large_data)
+        zip_bytes = raw_zip_path.read_bytes()
+        raw_zip_path.unlink()
+
+        # 图种：前 512 字节为标准 JPEG 头与填充，紧跟 ZIP 二进制数据
+        jpeg_header = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00".ljust(512, b"\x00")
+        self.assertEqual(len(jpeg_header), 512)
+        disguised_jpg.write_bytes(jpeg_header + zip_bytes)
 
         self.assertGreater(disguised_jpg.stat().st_size, 10 * 1024 * 1024)
 
@@ -215,7 +224,8 @@ class TestDisguiseAndWhitelist(unittest.TestCase):
     def test_case_4_nested_single_real_mp4_magic_mismatch_delivered(self):
         """
         Case 4: 嵌套解压产出单个真实 .mp4 视频（即使 > 10MB），
-        验证魔数不匹配（ftyp 非 PK/Rar/7z），直接终点交付，绝不误解。
+        经过解压引擎尝试失败后，验证自动触发核心回滚恢复原文件名 .mp4，
+        并加入 skipped_archives 安全退出，最终原样交付。
         """
         # 构造真实 MP4 文件头与数据 (以 \x00\x00\x00\x20ftyp 开头，> 10MB)
         mp4_header = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2mp41"
@@ -234,10 +244,18 @@ class TestDisguiseAndWhitelist(unittest.TestCase):
         dest_dir = self.test_dir / "case4_outer"
         self.assertTrue(dest_dir.exists(), f"交付目录不存在: {dest_dir}")
 
+        # 验证原文件名 .mp4 完好无损地被交付（回滚成功）
         delivered_video = dest_dir / video_name
         self.assertTrue(delivered_video.exists(), f"{video_name} 丢失")
         self.assertEqual(delivered_video.stat().st_size, len(large_video_data))
         self.assertEqual(delivered_video.read_bytes()[:32], large_video_data[:32])
+
+        # 验证临时重命名的 .zip 文件已被彻底回滚，绝不存在
+        self.assertFalse((dest_dir / "sample_movie.zip").exists(), "临时压缩包 sample_movie.zip 存在，未回滚！")
+
+        # 验证任何 _tmp_ 暂存目录均被清理
+        all_items = [p.name for p in dest_dir.iterdir()]
+        self.assertFalse(any(name.startswith("_tmp_") for name in all_items), f"存在 _tmp_ 残留: {all_items}")
 
         delivered_nfo = dest_dir / "movie.nfo"
         self.assertTrue(delivered_nfo.exists(), "movie.nfo 丢失")

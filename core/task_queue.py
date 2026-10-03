@@ -413,6 +413,9 @@ class TaskQueue(QObject):
         archive_str = str(archive)
         self.task_status_changed.emit(task_id, "", "验证密码", self._engine_name, "")
 
+        had_password_issue = False
+        last_failed_err: Optional[ExtractionFailedError] = None
+
         # 1) 无密码
         try:
             self._engine.extract(archive_str, dest, password=None)
@@ -420,11 +423,13 @@ class TaskQueue(QObject):
             return
         except PasswordRequiredError:
             logger.info(f"[{task_id}] {label} 需要密码")
+            had_password_issue = True
         except WrongPasswordError:
             logger.info(f"[{task_id}] {label} 无密码但引擎报告密码错误（异常情况）")
+            had_password_issue = True
             raise
-        except ExtractionFailedError:
-            pass
+        except ExtractionFailedError as e:
+            last_failed_err = e
 
         # 2) 遍历 JSON 密码库
         for i, pwd in enumerate(passwords):
@@ -434,11 +439,20 @@ class TaskQueue(QObject):
                 logger.info(f"[{task_id}] {label} 密码 #{i+1} 匹配成功")
                 return
             except WrongPasswordError:
+                had_password_issue = True
                 continue
             except PasswordRequiredError:
+                had_password_issue = True
                 continue
-            except ExtractionFailedError:
+            except ExtractionFailedError as e:
+                last_failed_err = e
                 continue
+
+        # 仅在确实检测到密码需求/错误时才阻塞等待用户输入；若纯属文件损坏/非压缩包，直接抛出 ExtractionFailedError
+        if not had_password_issue:
+            if last_failed_err is not None:
+                raise last_failed_err
+            raise ExtractionFailedError(archive_str, -1, f"{label} 解压失败（非压缩包或文件损坏）")
 
         # 3) 密码自学习（无限重试，直至正确或用户取消）
         self.task_progress.emit(task_id, "密码库全败，等待用户输入密码...")
@@ -476,16 +490,20 @@ class TaskQueue(QObject):
         archive_str = str(archive)
         self.task_status_changed.emit(task_id, "", "验证密码", self._engine_name, "")
 
+        had_password_issue = False
+        last_failed_err: Optional[ExtractionFailedError] = None
+
         try:
             self._engine.repair_extract(archive_str, dest, password=None)
             logger.info(f"[{task_id}] repair 无密码成功")
             return
         except PasswordRequiredError:
-            pass
+            had_password_issue = True
         except WrongPasswordError:
+            had_password_issue = True
             raise
-        except ExtractionFailedError:
-            pass
+        except ExtractionFailedError as e:
+            last_failed_err = e
 
         for i, pwd in enumerate(passwords):
             self.task_progress.emit(task_id, f"repair 尝试密码 ({i+1}/{len(passwords)})...")
@@ -494,11 +512,19 @@ class TaskQueue(QObject):
                 logger.info(f"[{task_id}] repair 密码 #{i+1} 匹配成功")
                 return
             except WrongPasswordError:
+                had_password_issue = True
                 continue
             except PasswordRequiredError:
+                had_password_issue = True
                 continue
-            except ExtractionFailedError:
+            except ExtractionFailedError as e:
+                last_failed_err = e
                 continue
+
+        if not had_password_issue:
+            if last_failed_err is not None:
+                raise last_failed_err
+            raise ExtractionFailedError(archive_str, -1, "repair 解压失败（非压缩包或文件损坏）")
 
         self.task_progress.emit(task_id, "repair 密码库全败，等待用户输入密码...")
         self.task_status_changed.emit(task_id, "", "验证密码", self._engine_name, "等待手动输入密码")
@@ -570,19 +596,33 @@ class TaskQueue(QObject):
         return False
 
     def _find_and_convert_disguised_archive(
-        self, base_dir: Path, skipped_archives: set[Path], task_id: str = "",
-    ) -> Optional[Path]:
+        self,
+        base_dir: Path,
+        skipped_archives: set[Path],
+        task_id: str = "",
+        passwords: Optional[list[str]] = None,
+        current_depth: int = 1,
+    ) -> bool:
         """
-        形态驱动的伪装检测（精准狙击单一大文件伪装，绝对不碰多文件业务内容）：
+        形态驱动的伪装检测与试解压机制（Trial Extraction）：
         1. 当 base 目录已经解压出子目录或多个文件（解包后的游戏/资源本体 Data Body）时：
            仅处理标准的真实压缩包，绝不对散装的图片/视频文件进行伪装下钻，立即视为终点交付。
         2. 当 base 目录仅包含“单个独立孤儿大文件”（或该大文件仅附带了 .txt, .url, .nfo 等说明文件）：
            - 终点白名单保护：.apk (及 .exe, .msi) 无论内部结构为何，绝对禁止作为压缩包拆解；
-           - 检查伪装后缀及大小阈值 (配置 disguise_min_size_mb，默认 >= 10MB)；
-           - 验证前 16 字节魔数：匹配则原位重命名为对应真实后缀 (零物理复制开销)，返回重命名后的路径；不匹配则不碰。
+           - 检查是否已在 skipped_archives 中；
+           - 检查伪装后缀（.jpg, .png, .mp4, .pdf 等）及大小阈值 (配置 disguise_min_size_mb，默认 >= 10MB)；
+        3. 对齐第一层的试解压机制（Trial Extraction）：
+           - 不再以 offset-0 魔数作为硬性门槛！优先使用 detect_archive_type，未识别（如各类图种）则统一使用 .zip；
+           - 原位重命名 candidate -> temp_archive（沙箱内同分区原子重命名，零磁盘 I/O）；
+           - 尝试解压到 temp_dest：
+             * 分支 A（解压成功）：删除 temp_archive，原子上移 temp_dest 下所有文件/目录到 parent_dir，清理 temp_dest，返回 True；
+             * 分支 B（解压失败 / 密码用尽用户取消 / 产物为空）：捕获异常，核心回滚还原原文件名，清理 temp_dest，登记到 skipped_archives，返回 False。
         """
         if not base_dir.is_dir():
-            return None
+            return False
+
+        if passwords is None:
+            passwords = []
 
         # 1. 检查是否存在子目录 (Data Body 保护)
         subdirs = [
@@ -594,7 +634,7 @@ class TaskQueue(QObject):
         ]
         if subdirs:
             logger.debug(f"[{task_id}] base 包含子目录，不满足单一大文件伪装形态: {[d.name for d in subdirs]}")
-            return None
+            return False
 
         # 2. 检查文件列表
         all_files = [
@@ -612,27 +652,27 @@ class TaskQueue(QObject):
 
         # 必须是“单个独立孤儿大文件”形态
         if len(non_accessory_files) != 1:
-            logger.debug(f"[{task_id}] base 包含 {len(non_accessory_files)} 个非说明文件，非孤儿大文件形态")
-            return None
+            logger.debug(f"[{task_id}] base 包含 {len(non_accessory_files)} 个非配件文件，非孤儿大文件形态")
+            return False
 
         candidate = non_accessory_files[0]
 
         if candidate in skipped_archives:
-            return None
+            return False
 
         # 3. 终点白名单保护：.apk (及 .exe, .msi) 无论内部结构为何，绝对禁止拆解
         if candidate.suffix.lower() in PROTECTED_ENDPOINT_EXTS:
             logger.info(f"[{task_id}] 命中受保护终点白名单 ({candidate.suffix}): {candidate.name}，视为终点交付")
-            return None
+            return False
 
         # 4. 如果已经是标准压缩包，交给普通循环处理
         if candidate.suffix.lower() in NESTED_ARCHIVE_EXTS:
-            return None
+            return False
 
         # 5. 后缀检查（.jpg, .png, .mp4, .pdf, .bin 等）
         if candidate.suffix.lower() not in POTENTIAL_DISGUISE_EXTS:
             logger.debug(f"[{task_id}] {candidate.name} 后缀不在伪装候选列表中")
-            return None
+            return False
 
         # 6. 大小阈值检查（如 > 10MB）
         min_mb = int(self._config.get("disguise_min_size_mb", 10))
@@ -640,27 +680,95 @@ class TaskQueue(QObject):
         try:
             size = candidate.stat().st_size
         except OSError:
-            return None
+            return False
 
         if size < min_bytes:
             logger.debug(f"[{task_id}] {candidate.name} 大小 ({size}B) 未达伪装阈值 ({min_bytes}B)")
-            return None
+            return False
 
-        # 7. 验证前 16 字节魔数
-        real_ext = detect_archive_type(candidate)
-        if not real_ext:
-            logger.info(f"[{task_id}] {candidate.name} 魔数非压缩包（真实媒体/文档），视为终点交付")
-            return None
+        # 7. 确定目标后缀：优先使用魔数识别；若未识别（如各类图种），统一使用 .zip
+        target_ext = detect_archive_type(candidate) or ".zip"
+        parent_dir = candidate.parent
+        temp_archive = ensure_unique_path(parent_dir / f"{candidate.stem}{target_ext}")
 
-        # 8. 魔数匹配：100% 确认伪装包！在沙箱内原位重命名为对应真实后缀 (零物理复制开销)
-        target_path = ensure_unique_path(candidate.with_suffix(real_ext))
+        # 8. 原位重命名为目标压缩包格式（零磁盘 I/O）
+        orig_candidate = candidate
         try:
-            os.replace(candidate, target_path)
-            logger.info(f"[{task_id}] 命中单一大文件伪装: {candidate.name} -> 原位重命名为 {target_path.name}")
-            return target_path
+            os.replace(orig_candidate, temp_archive)
+            logger.info(f"[{task_id}] 孤儿形态试探：原位重命名 {orig_candidate.name} -> {temp_archive.name}")
         except OSError as e:
-            logger.error(f"[{task_id}] 原位重命名失败 ({candidate} -> {target_path}): {e}")
-            return None
+            logger.error(f"[{task_id}] 原位重命名失败 ({orig_candidate} -> {temp_archive}): {e}")
+            return False
+
+        # 9. 针对 temp_archive 进行解压尝试 (Trial Extraction)
+        self.task_progress.emit(task_id, f"尝试解压伪装包 (层{current_depth}): {temp_archive.name}")
+        temp_dest = ensure_unique_path(parent_dir / f"_tmp_{temp_archive.stem}")
+
+        try:
+            self._extract_with_passwords(task_id, temp_archive, str(temp_dest), passwords)
+            # 解压产物检查：若 temp_dest 为空，说明解压未产出有效内容，回滚处理
+            if not temp_dest.exists() or not any(temp_dest.iterdir()):
+                logger.warning(f"[{task_id}] 试解压产物为空 ({temp_archive.name})，触发回滚")
+                try:
+                    os.replace(temp_archive, orig_candidate)
+                except OSError:
+                    pass
+                if temp_dest.exists():
+                    shutil.rmtree(str(temp_dest), ignore_errors=True)
+                skipped_archives.add(orig_candidate)
+                return False
+        except (PasswordRequiredError, WrongPasswordError, ExtractionFailedError) as e:
+            logger.warning(f"[{task_id}] 伪装试解压失败/需密码 ({temp_archive.name}): {e}，触发核心回滚")
+            # 【核心回滚】：立即将 temp_archive 还原重命名为原始文件名
+            try:
+                os.replace(temp_archive, orig_candidate)
+                logger.info(f"[{task_id}] 已回滚还原为原始文件: {orig_candidate.name}")
+            except OSError as re_err:
+                logger.error(f"[{task_id}] 回滚重命名失败 ({temp_archive} -> {orig_candidate}): {re_err}")
+            # 清理残余的 temp_dest
+            if temp_dest.exists():
+                shutil.rmtree(str(temp_dest), ignore_errors=True)
+            # 将该原始文件路径登记到 skipped_archives
+            skipped_archives.add(orig_candidate)
+            return False
+        except Exception as e:
+            logger.error(f"[{task_id}] 伪装试解压遇到异常 ({temp_archive.name}): {e}，触发核心回滚")
+            try:
+                os.replace(temp_archive, orig_candidate)
+            except OSError:
+                pass
+            if temp_dest.exists():
+                shutil.rmtree(str(temp_dest), ignore_errors=True)
+            skipped_archives.add(orig_candidate)
+            return False
+
+        # 分支 A（解压成功）：说明它确实是伪装包/图种！
+        # a. 删除临时压缩包 temp_archive.unlink()
+        try:
+            temp_archive.unlink()
+            logger.info(f"[{task_id}] 伪装包解压成功，已删除临时压缩包: {temp_archive.name}")
+        except OSError as e:
+            logger.warning(f"[{task_id}] 删除临时压缩包失败 ({temp_archive.name}): {e}")
+
+        # b. 将 temp_dest 下的所有文件/目录原子移动到 parent_dir
+        if temp_dest.exists():
+            for item in list(temp_dest.iterdir()):
+                dest = ensure_unique_path(parent_dir / item.name)
+                try:
+                    shutil.move(str(item), str(dest))
+                    logger.debug(f"[{task_id}] 原子上移: {item.name} → {dest.name}")
+                except Exception as e:
+                    logger.error(f"[{task_id}] 原子上移失败 ({item.name} → {dest.name}): {e}")
+                    raise SandboxError(f"原子上移文件失败: {e}")
+
+            # c. 清理空的 temp_dest
+            try:
+                shutil.rmtree(str(temp_dest), ignore_errors=True)
+                logger.debug(f"[{task_id}] 已清除暂存目录: {temp_dest}")
+            except OSError as e:
+                logger.warning(f"[{task_id}] 删除暂存目录失败 ({temp_dest}): {e}")
+
+        return True
 
     def _extract_with_passwords(
         self, task_id: str, archive: Path, dest: str, passwords: list[str],
@@ -691,10 +799,13 @@ class TaskQueue(QObject):
             ]
 
             if not archives:
-                # 检查是否存在单一大文件伪装包
-                disguised = self._find_and_convert_disguised_archive(base, skipped_archives, task_id)
-                if disguised:
-                    archives = [disguised]
+                # 检查是否存在单一大文件伪装包并尝试试解压 (Trial Extraction)
+                handled = self._find_and_convert_disguised_archive(
+                    base, skipped_archives, task_id, passwords, current_depth
+                )
+                if handled:
+                    current_depth += 1
+                    continue
                 else:
                     break
 
