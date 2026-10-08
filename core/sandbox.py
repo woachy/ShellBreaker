@@ -8,6 +8,8 @@ import shutil
 import logging
 import re
 import sys
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
 
@@ -42,6 +44,145 @@ ACCESSORY_EXTS = frozenset({".txt", ".url", ".nfo", ".html", ".htm", ".md"})
 
 # 分卷正则
 PART_PATTERN = re.compile(r"^(.*)\.part(\d+)\.rar$", re.IGNORECASE)
+
+
+class SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("wFunc", wintypes.UINT),
+        ("pFrom", wintypes.LPCWSTR),
+        ("pTo", wintypes.LPCWSTR),
+        ("fFlags", wintypes.WORD),
+        ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", wintypes.LPVOID),
+        ("lpszProgressTitle", wintypes.LPCWSTR),
+    ]
+
+
+FO_DELETE = 0x0003
+# 标志位：移至回收站 (0x0040) | 不弹确认框 (0x0010) | 静默无进度条 (0x0004) | 不弹系统报错窗 (0x0400)
+FOF_RECYCLE_SILENT = 0x0040 | 0x0010 | 0x0004 | 0x0400
+
+
+def send_to_recycle_bin(file_path: Path | str) -> bool:
+    """将文件静默安全移至 Windows 回收站（要求双 Null 结尾宽字符缓冲区）。"""
+    p = Path(file_path).resolve()
+    if not p.is_file():
+        return False
+    buffer = f"{str(p)}\0\0"
+    op = SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = buffer
+    op.pTo = None
+    op.fFlags = FOF_RECYCLE_SILENT
+    try:
+        ret = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        return ret == 0 and not op.fAnyOperationsAborted
+    except Exception as e:
+        logger.warning(f"SHFileOperationW 移入回收站失败 ({p}): {e}")
+        return False
+
+
+def is_primary_part(filename: str) -> bool:
+    """判断文件是否为主/首卷分卷（part1/part01 或 .001 / .7z.001 / .zip.001）。"""
+    m_rar = re.search(r"\.part(\d+)\.rar$", filename, re.IGNORECASE)
+    if m_rar:
+        return int(m_rar.group(1)) == 1
+    m_split = re.search(r"\.(?:7z|zip)\.(\d+)$", filename, re.IGNORECASE)
+    if m_split:
+        return int(m_split.group(1)) == 1
+    m_gen = re.search(r"\.(\d{3,})$", filename, re.IGNORECASE)
+    if m_gen:
+        return int(m_gen.group(1)) == 1
+    return False
+
+
+def is_secondary_volume(filename: str) -> bool:
+    """判断文件是否为非首卷分卷（part02+ 或 .002+ 或经典 .r00+ / .z01+）。"""
+    m_part = re.search(r"\.part(\d+)\.rar$", filename, re.IGNORECASE)
+    if m_part:
+        return int(m_part.group(1)) > 1
+    m_num = re.search(r"\.(?:7z|zip)\.(\d+)$", filename, re.IGNORECASE)
+    if m_num:
+        return int(m_num.group(1)) > 1
+    m_gen = re.search(r"\.(\d{3,})$", filename, re.IGNORECASE)
+    if m_gen:
+        return int(m_gen.group(1)) > 1
+    m_classic = re.search(r"\.[rz]\d{2,}$", filename, re.IGNORECASE)
+    if m_classic:
+        return True
+    return False
+
+
+def get_part_group(src_path: str | Path) -> list[Path]:
+    """
+    查找与给定分卷文件同组的所有分卷文件（支持 .partN.rar 任意补零、.7z.001 / .zip.001、
+    通用数字分卷 .001 / .002，以及经典分卷 .rar/.r00 / .zip/.z01）。
+    """
+    src = Path(src_path).resolve()
+    if not src.parent.exists():
+        return [src]
+
+    # 1. 匹配 .partN.rar 格式（兼容任意补零位数）
+    m_rar = re.match(r"^(.*)\.part\d+\.rar$", src.name, re.IGNORECASE)
+    if m_rar:
+        base = re.escape(m_rar.group(1))
+        pattern = re.compile(rf"^{base}\.part\d+\.rar$", re.IGNORECASE)
+        try:
+            parts = sorted([p for p in src.parent.iterdir() if p.is_file() and pattern.match(p.name)])
+            return parts if parts else [src]
+        except OSError:
+            return [src]
+
+    # 2. 匹配 .7z.001 / .zip.001 分卷
+    m_split = re.match(r"^(.*)\.(7z|zip)\.\d+$", src.name, re.IGNORECASE)
+    if m_split:
+        base = re.escape(m_split.group(1))
+        ext = re.escape(m_split.group(2))
+        pattern = re.compile(rf"^{base}\.{ext}\.\d+$", re.IGNORECASE)
+        try:
+            parts = sorted([p for p in src.parent.iterdir() if p.is_file() and pattern.match(p.name)])
+            return parts if parts else [src]
+        except OSError:
+            return [src]
+
+    # 3. 匹配通用纯数字分卷 .001, .002 等
+    m_gen = re.match(r"^(.*)\.(\d{3,})$", src.name, re.IGNORECASE)
+    if m_gen:
+        base = re.escape(m_gen.group(1))
+        pattern = re.compile(rf"^{base}\.\d+$", re.IGNORECASE)
+        try:
+            parts = sorted([p for p in src.parent.iterdir() if p.is_file() and pattern.match(p.name)])
+            return parts if parts else [src]
+        except OSError:
+            return [src]
+
+    # 4. 匹配经典 RAR 分卷 (.rar, .r00, .r01...)
+    m_classic_rar = re.match(r"^(.*)\.(?:rar|r\d{2,})$", src.name, re.IGNORECASE)
+    if m_classic_rar:
+        base = re.escape(m_classic_rar.group(1))
+        pattern = re.compile(rf"^{base}\.(?:rar|r\d+)$", re.IGNORECASE)
+        try:
+            parts = sorted([p for p in src.parent.iterdir() if p.is_file() and pattern.match(p.name)])
+            if len(parts) > 1:
+                return parts
+        except OSError:
+            pass
+
+    # 5. 匹配经典 ZIP 分卷 (.zip, .z01, .z02...)
+    m_classic_zip = re.match(r"^(.*)\.(?:zip|z\d{2,})$", src.name, re.IGNORECASE)
+    if m_classic_zip:
+        base = re.escape(m_classic_zip.group(1))
+        pattern = re.compile(rf"^{base}\.(?:zip|z\d+)$", re.IGNORECASE)
+        try:
+            parts = sorted([p for p in src.parent.iterdir() if p.is_file() and pattern.match(p.name)])
+            if len(parts) > 1:
+                return parts
+        except OSError:
+            pass
+
+    return [src]
 
 
 def detect_archive_type(file_path: str | Path) -> Optional[str]:
@@ -182,7 +323,7 @@ class SandboxManager:
             raise SandboxError(f"受保护的终点程序文件 ({ext})，禁止作为压缩包解压: {src.name}")
 
         is_known = ext in KNOWN_ARCHIVE_EXTS
-        if PART_PATTERN.match(src.name):
+        if PART_PATTERN.match(src.name) or is_primary_part(src.name) or is_secondary_volume(src.name):
             is_known = True
 
         if is_known:
@@ -347,32 +488,20 @@ class SandboxManager:
         self._active_sandboxes.clear()
         return removed
 
-    # ---------- 分卷分析 ----------
+    # ---------- 分卷分析与回收站 ----------
 
     @staticmethod
     def is_primary_part(filename: str) -> bool:
-        m = PART_PATTERN.match(filename)
-        if not m:
-            return False
-        part_num = int(m.group(2))
-        return part_num == 1
+        return is_primary_part(filename)
+
+    @staticmethod
+    def is_secondary_volume(filename: str) -> bool:
+        return is_secondary_volume(filename)
 
     @staticmethod
     def get_part_group(src_path: str | Path) -> list[Path]:
-        src = Path(src_path).resolve()
-        m = PART_PATTERN.match(src.name)
-        if not m:
-            return [src]
+        return get_part_group(src_path)
 
-        base = m.group(1)
-        parent = src.parent
-        parts = []
-        n = 1
-        while True:
-            candidate = parent / f"{base}.part{n}.rar"
-            if candidate.exists():
-                parts.append(candidate)
-                n += 1
-            else:
-                break
-        return parts if parts else [src]
+    @staticmethod
+    def send_to_recycle_bin(file_path: Path | str) -> bool:
+        return send_to_recycle_bin(file_path)

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QCheckBox,
     QFileDialog,
     QMessageBox,
     QDialogButtonBox,
@@ -178,6 +179,11 @@ class SettingsDialog(QDialog):
         self._spin_min_size_mb.setSuffix(" MB")
         perf_layout.addRow("最小解压文件大小：", self._spin_min_size_mb)
 
+        self._cb_delete_source = QCheckBox("解压成功后自动删除源压缩包（移至回收站）")
+        self._cb_delete_source.setToolTip("任务解压交付成功后，将源文件（包含同族分卷）安全移入系统回收站")
+        self._cb_delete_source.setChecked(bool(cfg.get("delete_source_after_extract", False)))
+        perf_layout.addRow("", self._cb_delete_source)
+
         root.addWidget(perf_group)
 
         root.addStretch(1)
@@ -258,6 +264,7 @@ class SettingsDialog(QDialog):
         self._config.set("max_workers", self._spin_workers.value())
         self._config.set("max_scan_depth", self._spin_scan_depth.value())
         self._config.set("min_file_size_mb", self._spin_min_size_mb.value())
+        self._config.set("delete_source_after_extract", self._cb_delete_source.isChecked())
         self._config.save()
 
         logger.info("全局设置已保存")

@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     "disguise_min_size_mb": 10,        # 嵌套层伪装包最小识别大小 (MB)，默认 10MB
     "bandizip_path": "",               # bz.exe 绝对路径，空字符串=自动扫描
     "winrar_path": "",                 # WinRAR.exe 绝对路径，空字符串=自动扫描
+    "delete_source_after_extract": False, # 解压成功后自动删除源文件（移至回收站）
 }
 
 

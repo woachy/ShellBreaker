@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QPushButton,
+    QCheckBox,
     QMessageBox,
     QInputDialog,
     QSizePolicy,
@@ -39,7 +40,8 @@ from PySide6.QtGui import (
 )
 
 from core.task_queue import TaskQueue
-from core.sandbox import SandboxManager, PROTECTED_ENDPOINT_EXTS
+from core.sandbox import SandboxManager, PROTECTED_ENDPOINT_EXTS, is_secondary_volume
+from data.config_manager import ConfigManager
 
 logger = logging.getLogger("ShellBreaker.MainWindow")
 
@@ -152,7 +154,10 @@ class DropZone(QGroupBox):
             return
 
         event.acceptProposedAction()
-        clean_paths = [self.clean_path_from_url(u.toString()) for u in urls]
+        clean_paths = [
+            (u.toLocalFile() if hasattr(u, "isLocalFile") and u.isLocalFile() else self.clean_path_from_url(u.toString()))
+            for u in urls
+        ]
         logger.info(f"DropZone 接收到 {len(clean_paths)} 个路径: {clean_paths}")
 
         if self._on_paths_ready:
@@ -177,6 +182,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)  # 支持全局窗口拖拽
 
         # ---- 核心层 ----
+        self._config = ConfigManager()
         self._task_queue = TaskQueue()
         self._sandbox_mgr = SandboxManager()
 
@@ -233,6 +239,12 @@ class MainWindow(QMainWindow):
         self._lbl_stats = QLabel("📊 总任务: 0 | 成功: 0 | 失败: 0 | 处理中: 0")
         self._lbl_stats.setObjectName("lblStats")
 
+        self._cb_delete_source = QCheckBox("🗑️ 解压后移至回收站")
+        self._cb_delete_source.setObjectName("cbDeleteSource")
+        self._cb_delete_source.setToolTip("解压成功后自动将源压缩包（及关联同族分卷）安全移入 Windows 回收站")
+        self._cb_delete_source.setChecked(bool(self._config.get("delete_source_after_extract", False)))
+        self._cb_delete_source.toggled.connect(self._on_delete_source_toggled)
+
         self.btn_clean_finished = QPushButton("🧹 清空已完成")
         self.btn_clean_finished.setObjectName("btnCleanFinished")
         self.btn_clean_finished.setToolTip("从看板中移除所有成功或已跳过的任务")
@@ -240,6 +252,7 @@ class MainWindow(QMainWindow):
 
         stat_layout.addWidget(self._lbl_stats)
         stat_layout.addStretch(1)
+        stat_layout.addWidget(self._cb_delete_source)
         stat_layout.addWidget(self.btn_clean_finished)
         root.addWidget(stat_panel)
 
@@ -308,7 +321,10 @@ class MainWindow(QMainWindow):
         if not mime_data.hasUrls():
             return
         event.acceptProposedAction()
-        clean_paths = [DropZone.clean_path_from_url(u.toString()) for u in mime_data.urls()]
+        clean_paths = [
+            (u.toLocalFile() if hasattr(u, "isLocalFile") and u.isLocalFile() else DropZone.clean_path_from_url(u.toString()))
+            for u in urls
+        ]
         logger.info(f"主窗口全局拖拽接收到 {len(clean_paths)} 个路径: {clean_paths}")
         self._on_drop_paths_ready(clean_paths)
 
@@ -370,6 +386,17 @@ class MainWindow(QMainWindow):
                 logger.info(f"终点白名单保护，跳过: {filename}")
                 return
 
+            # 非首卷分卷检查 (.part02+ 或 .002+)
+            if is_secondary_volume(filename):
+                self._add_task_row(task_id, filename)
+                self._set_cell(self._task_rows[task_id], 1, "已跳过")
+                self._set_cell(self._task_rows[task_id], 3, "非首卷分卷（由首卷统一解压）")
+                self._task_data[task_id]["status"] = "已跳过"
+                self._task_data[task_id]["remark"] = "非首卷分卷（由首卷统一解压）"
+                self._update_statistics()
+                logger.info(f"非首卷分卷，跳过单独解压: {filename}")
+                return
+
             # 大小预检查
             if self._task_queue._is_file_too_small(clean_path):
                 self._add_task_row(task_id, filename)
@@ -414,22 +441,18 @@ class MainWindow(QMainWindow):
         """信号驱动：原地更新表格行，绝不允许插入重复行（修复'分身'Bug）。"""
         row = self._task_rows.get(task_id)
         if row is None:
-            if status == "排队中":
-                # 递归扫描首次发现：插入新行（唯一合法的插入时机）
-                self._add_task_row(task_id, filename)
-                row = self._task_rows[task_id]
-                if task_id not in self._task_data:
-                    self._task_data[task_id] = {
-                        "src_path": "",
-                        "filename": filename,
-                        "status": status,
-                        "engine": engine,
-                        "dest_path": "",
-                        "remark": remark,
-                    }
-            else:
-                logger.warning(f"收到状态更新但 task_id 不在表格中: {task_id} status={status}")
-                return
+            # 首次接收到该任务状态（包含扫描发现的排队任务与直接跳过的分卷/小文件）：插入新行
+            self._add_task_row(task_id, filename)
+            row = self._task_rows[task_id]
+            if task_id not in self._task_data:
+                self._task_data[task_id] = {
+                    "src_path": "",
+                    "filename": filename,
+                    "status": status,
+                    "engine": engine,
+                    "dest_path": "",
+                    "remark": remark,
+                }
 
         # 更新元数据记录
         if task_id in self._task_data:
@@ -738,10 +761,18 @@ class MainWindow(QMainWindow):
         from ui.password_dialog import PasswordDialog
         PasswordDialog(self).exec()
 
+    def _on_delete_source_toggled(self, checked: bool):
+        self._config.set("delete_source_after_extract", checked)
+        self._config.save()
+        logger.info(f"源文件自动删除快捷开关变更为: {checked}")
+
     def _on_settings_clicked(self):
         logger.info("用户点击「全局设置」")
         from ui.settings_dialog import SettingsDialog
         dialog = SettingsDialog(self)
         if dialog.exec():
-            # 用户点击了保存 → 重载调度器配置
+            # 用户点击了保存 → 重载调度器配置并同步快捷开关
             self._task_queue.reload_config()
+            self._cb_delete_source.setChecked(
+                bool(self._config.get("delete_source_after_extract", False))
+            )

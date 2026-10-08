@@ -26,6 +26,9 @@ from core.sandbox import (
     POTENTIAL_DISGUISE_EXTS,
     ACCESSORY_EXTS,
     detect_archive_type,
+    is_secondary_volume,
+    get_part_group,
+    send_to_recycle_bin,
 )
 from core.engine import (
     EngineType,
@@ -43,10 +46,10 @@ MAX_NEST_DEPTH = 50
 NESTED_ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"}
 BLIND_EXTRACT_EXTS = {".zip", ".rar", ".7z", ".001", ".tar", ".gz", ".bz2", ".xz"}
 
-# 递归扫描目标后缀：标准压缩包 + 常见伪装后缀（白名单）
+# 递归扫描目标后缀：标准压缩包 + 常见伪装后缀（白名单）+ 分卷首卷
 SCAN_TARGET_EXTS = frozenset({
     # 标准压缩包
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".001",
     # 伪装后缀
     ".mp4", ".jpg", ".png", ".pdf",
 })
@@ -139,6 +142,9 @@ class TaskQueue(QObject):
             self.start()
         file_name = os.path.basename(src_path)
         from core.sandbox import PART_PATTERN
+        if is_secondary_volume(file_name):
+            logger.info(f"跳过非主分卷: {src_path}")
+            return None
         if not SandboxManager.is_primary_part(file_name):
             if PART_PATTERN.match(file_name):
                 logger.info(f"跳过非主分卷: {src_path}")
@@ -191,8 +197,15 @@ class TaskQueue(QObject):
         for entry in entries:
             if entry.is_file():
                 ext = entry.suffix.lower()
-                if ext in SCAN_TARGET_EXTS:
+                if ext in SCAN_TARGET_EXTS or is_secondary_volume(entry.name):
                     src_str = str(entry.resolve())
+                    # 分卷检查：若为非首卷分卷，直接跳过并展示状态
+                    if is_secondary_volume(entry.name):
+                        task_id = str(uuid.uuid4())[:8]
+                        self.task_status_changed.emit(task_id, entry.name, "已跳过(非首卷分卷)", self._engine_name, "由首卷统一解压")
+                        logger.info(f"[递归扫描] 非首卷分卷，跳过: {entry.name}")
+                        count += 1
+                        continue
                     # 大小预检查
                     if self._is_file_too_small(src_str):
                         task_id = str(uuid.uuid4())[:8]
@@ -284,6 +297,10 @@ class TaskQueue(QObject):
             # Step 4.6: 回收沙箱（仅在搬运成功后）
             self._sandbox.cleanup_sandbox(sandbox_dir)
             sandbox_dir = None  # 已回收，防止后续清理
+
+            # 自动删除源文件（移至 Windows 回收站）
+            if bool(self._config.get("delete_source_after_extract", False)):
+                self._handle_delete_source(task_id, src_path, final_path)
 
             success = True
             logger.info(f"[{task_id}] [交付成功] 文件已移动至: {final_path}")
@@ -437,6 +454,7 @@ class TaskQueue(QObject):
             try:
                 self._engine.extract(archive_str, dest, password=pwd)
                 logger.info(f"[{task_id}] {label} 密码 #{i+1} 匹配成功")
+                self._pwd_mgr.record_hit(pwd)
                 return
             except WrongPasswordError:
                 had_password_issue = True
@@ -467,8 +485,7 @@ class TaskQueue(QObject):
             try:
                 self._engine.extract(archive_str, dest, password=user_pwd)
                 logger.info(f"[{task_id}] {label} 用户密码匹配成功")
-                self._pwd_mgr.reload()
-                self._pwd_mgr.add(user_pwd, "[自动入库]")
+                self._pwd_mgr.record_hit(user_pwd)
                 if user_pwd not in passwords:
                     passwords.append(user_pwd)
                 self.task_progress.emit(task_id, "密码已自动入库 ✅")
@@ -510,6 +527,7 @@ class TaskQueue(QObject):
             try:
                 self._engine.repair_extract(archive_str, dest, password=pwd)
                 logger.info(f"[{task_id}] repair 密码 #{i+1} 匹配成功")
+                self._pwd_mgr.record_hit(pwd)
                 return
             except WrongPasswordError:
                 had_password_issue = True
@@ -538,8 +556,7 @@ class TaskQueue(QObject):
             try:
                 self._engine.repair_extract(archive_str, dest, password=user_pwd)
                 logger.info(f"[{task_id}] repair 用户密码匹配成功")
-                self._pwd_mgr.reload()
-                self._pwd_mgr.add(user_pwd, "[自动入库]")
+                self._pwd_mgr.record_hit(user_pwd)
                 if user_pwd not in passwords:
                     passwords.append(user_pwd)
                 self.task_progress.emit(task_id, "密码已自动入库 ✅")
@@ -577,6 +594,51 @@ class TaskQueue(QObject):
                     logger.debug(f"垃圾回收已删除: {f}")
             except OSError as e:
                 logger.warning(f"垃圾回收失败 ({f}): {e}")
+
+    def _handle_delete_source(self, task_id: str, src_path: str, final_path: str):
+        """
+        解压成功后，安全将源文件（及关联同族分卷）移入 Windows 回收站。
+        安全边界检查：
+        1. 必须为真实存在的文件
+        2. 排除白名单终点程序格式
+        3. 交付目录与源文件绝不重叠（源文件绝不能在 final_path 内部）
+        4. 获取同族分卷，逐一调用静默回收站 API
+        5. 绝不污染 task_status_changed 的 dest_dir 备注
+        """
+        try:
+            src = Path(src_path).resolve()
+            if not src.is_file():
+                logger.debug(f"[{task_id}] 源文件非普通文件或不存在，跳过删除: {src}")
+                return
+            if src.suffix.lower() in PROTECTED_ENDPOINT_EXTS:
+                logger.warning(f"[{task_id}] 源文件属于受保护终点类型，禁止删除: {src}")
+                return
+
+            final_p = Path(final_path).resolve()
+            try:
+                src.relative_to(final_p)
+                logger.warning(f"[{task_id}] 安全防护：源文件位于交付目标目录内，禁止删除: {src}")
+                return
+            except ValueError:
+                pass
+
+            targets = get_part_group(src)
+            for t in targets:
+                if not t.is_file():
+                    continue
+                try:
+                    t.resolve().relative_to(final_p)
+                    logger.warning(f"[{task_id}] 安全防护：分卷文件位于交付目标目录内，禁止删除: {t}")
+                    continue
+                except ValueError:
+                    pass
+                ok = send_to_recycle_bin(t)
+                if ok:
+                    logger.info(f"[{task_id}] 源文件已安全移至回收站: {t.name}")
+                else:
+                    logger.warning(f"[{task_id}] 源文件移至回收站失败: {t.name}")
+        except Exception as e:
+            logger.error(f"[{task_id}] 执行自动删除源文件异常: {e}")
 
     # ---------- 嵌套解压 ----------
 
