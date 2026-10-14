@@ -26,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='懒人解压',
+    name='ShellBreaker',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -684,6 +684,153 @@ class TestFeatureUIComponents(unittest.TestCase):
         finally:
             win.close()
 
+    def test_main_window_drop_event_handles_urls_safely(self):
+        """测试主窗口全局拖拽 dropEvent 解析 QUrl 时安全无异常（验证无 NameError 并成功调度）。"""
+        from unittest.mock import patch, MagicMock
+        from PySide6.QtCore import QPointF, Qt, QUrl, QMimeData
+        from PySide6.QtGui import QDropEvent
+
+        win = self.MainWindow()
+        try:
+            mime_data = QMimeData()
+            test_file_path = r"C:\test\sample.zip"
+            mime_data.setUrls([QUrl.fromLocalFile(test_file_path)])
+
+            try:
+                event = QDropEvent(
+                    QPointF(10.0, 10.0),
+                    Qt.DropAction.CopyAction,
+                    mime_data,
+                    Qt.MouseButton.LeftButton,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+            except Exception:
+                event = MagicMock()
+                event.mimeData.return_value = mime_data
+                event.acceptProposedAction = MagicMock()
+
+            with patch.object(win, "_on_drop_paths_ready", wraps=win._on_drop_paths_ready) as mock_ready, \
+                 patch("os.path.isfile", return_value=True), \
+                 patch("os.path.getsize", return_value=1024 * 1024), \
+                 patch.object(win._task_queue, "submit_existing"):
+
+                # 触发 dropEvent，断言绝不引发 NameError
+                try:
+                    win.dropEvent(event)
+                except NameError as e:
+                    self.fail(f"win.dropEvent raised NameError: {e}")
+
+                # 验证 _on_drop_paths_ready 被成功调用
+                mock_ready.assert_called_once()
+
+                # 验证 win._task_data 成功接收到该任务
+                matched_tasks = [
+                    d for d in win._task_data.values()
+                    if d.get("filename") == "sample.zip"
+                ]
+                self.assertGreaterEqual(
+                    len(matched_tasks),
+                    1,
+                    "win._task_data 必须成功录入拖拽的 sample.zip 任务",
+                )
+        finally:
+            win.close()
+
+
+class TestConfigManagerConcurrency(unittest.TestCase):
+    """配置管理器多线程高并发读写与持久化安全测试。"""
+
+    def setUp(self):
+        self.scratch = PROJECT_ROOT / "tests" / "test_scratch_cfg_concurrency"
+        if self.scratch.exists():
+            shutil.rmtree(self.scratch, ignore_errors=True)
+        self.scratch.mkdir(parents=True, exist_ok=True)
+
+        import data.config_manager
+        self.cfg = ConfigManager()
+        self._orig_file = data.config_manager.CONFIG_PATH
+        self.test_json = self.scratch / "config.json"
+        data.config_manager.CONFIG_PATH = self.test_json
+
+        # 备份并重置单例数据
+        with self.cfg._lock:
+            self._backup_data = dict(self.cfg._data)
+            self._backup_loaded = self.cfg._loaded
+            self.cfg._data = dict(data.config_manager.DEFAULT_CONFIG)
+            self.cfg._loaded = True
+            self.cfg.save()
+
+    def tearDown(self):
+        import data.config_manager
+        with self.cfg._lock:
+            self.cfg._data = dict(self._backup_data)
+            self.cfg._loaded = self._backup_loaded
+            if self._orig_file:
+                data.config_manager.CONFIG_PATH = self._orig_file
+                self.cfg.save()
+
+        if self.scratch.exists():
+            shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def test_config_manager_thread_safety_concurrency(self):
+        """测试多线程并发进行 set, get, get_all, save 操作，无死锁、无异常、无 JSON 损坏。"""
+        threads = []
+        errors = []
+        num_threads = 10
+        iterations = 50
+
+        def worker(thread_id: int):
+            try:
+                for i in range(iterations):
+                    # set
+                    self.cfg.set(f"thread_{thread_id}_key", f"val_{thread_id}_{i}")
+                    # get
+                    val = self.cfg.get(f"thread_{thread_id}_key")
+                    if val != f"val_{thread_id}_{i}":
+                        raise ValueError(f"Thread {thread_id} read inconsistent value: {val}")
+                    # get_all
+                    all_dict = self.cfg.get_all()
+                    if not isinstance(all_dict, dict):
+                        raise TypeError(f"Thread {thread_id} get_all did not return dict")
+                    # save
+                    self.cfg.save()
+            except Exception as e:
+                errors.append((thread_id, e))
+
+        for tid in range(num_threads):
+            t = threading.Thread(target=worker, args=(tid,), name=f"cfg-worker-{tid}")
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=30.0)
+            self.assertFalse(t.is_alive(), f"线程 {t.name} 超时死锁！")
+
+        self.assertEqual(len(errors), 0, f"并发读写出现异常: {errors}")
+
+        # 验证磁盘上的 JSON 文件完整且能被正常解析（无文件损坏或截断）
+        self.assertTrue(self.test_json.exists(), "持久化配置文件必须存在")
+        with open(self.test_json, "r", encoding="utf-8") as f:
+            disk_data = json.load(f)
+
+        # 验证各线程最后一次写入的值均保留在磁盘中
+        for tid in range(num_threads):
+            key = f"thread_{tid}_key"
+            expected_val = f"val_{tid}_{iterations - 1}"
+            self.assertIn(key, disk_data)
+            self.assertEqual(disk_data[key], expected_val)
+
+        # 恢复默认配置
+        self.cfg.reset_defaults()
+        with open(self.test_json, "r", encoding="utf-8") as f:
+            reset_data = json.load(f)
+        import data.config_manager
+        self.assertEqual(
+            reset_data["default_engine"],
+            data.config_manager.DEFAULT_CONFIG["default_engine"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+

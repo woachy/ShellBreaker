@@ -33,13 +33,13 @@ Windows 批量智能解压工具 —— 专治反复嵌套压缩、改后缀伪�
 ## 快速上手
 
 ### 方式一：下载即用（推荐）
-直接从仓库的 **[Releases](../../releases)** 页面下载已打包好的 `懒人解压.exe`，解压到任意目录双击即可运行。
+直接从仓库的 **[Releases](../../releases)** 页面下载已打包好的 `ShellBreaker.exe`（或压缩包），解压到任意目录双击即可运行。
 
 ### 方式二：源码运行
 1. 确保已安装 Python 3.12+。
 2. 安装依赖：
    ```bash
-   pip install PySide6
+   pip install -r requirements.txt
    ```
 3. 运行程序：
    ```bash

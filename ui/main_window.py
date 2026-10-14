@@ -320,6 +320,9 @@ class MainWindow(QMainWindow):
         mime_data = event.mimeData()
         if not mime_data.hasUrls():
             return
+        urls = mime_data.urls()
+        if not urls:
+            return
         event.acceptProposedAction()
         clean_paths = [
             (u.toLocalFile() if hasattr(u, "isLocalFile") and u.isLocalFile() else DropZone.clean_path_from_url(u.toString()))
@@ -327,6 +330,10 @@ class MainWindow(QMainWindow):
         ]
         logger.info(f"主窗口全局拖拽接收到 {len(clean_paths)} 个路径: {clean_paths}")
         self._on_drop_paths_ready(clean_paths)
+        if len(clean_paths) == 1:
+            self.drop_zone._hint_label.setText(f"已接收: {clean_paths[0]}")
+        else:
+            self.drop_zone._hint_label.setText(f"已接收 {len(clean_paths)} 个文件/文件夹")
 
     # ---------- 手动选择按钮事件 ----------
 
