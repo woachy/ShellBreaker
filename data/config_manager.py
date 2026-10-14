@@ -71,7 +71,7 @@ class ConfigManager:
             CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
-            logger.info(f"配置已保存: {dict(self._data)}")
+            logger.debug(f"配置已保存: {dict(self._data)}")
 
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:

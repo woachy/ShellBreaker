@@ -10,6 +10,8 @@ jobs:
   test:
     name: Test on Windows
     runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
 
     steps:
       - name: Checkout repository
@@ -20,6 +22,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
+
+      - name: Install compression tools (Bandizip & WinRAR)
+        run: |
+          choco install bandizip winrar -y --no-progress
+        shell: pwsh
 
       - name: Upgrade pip and install dependencies
         run: |

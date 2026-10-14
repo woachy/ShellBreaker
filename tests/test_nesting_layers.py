@@ -48,7 +48,8 @@ class TestNestingLayers(unittest.TestCase):
 
         self.queue = TaskQueue()
         self.queue._ensure_engine()
-        self.assertIsNotNone(self.queue._engine, "测试需要可用的解压引擎 (Bandizip 或 WinRAR)")
+        if self.queue._engine is None:
+            self.skipTest("测试需要可用的解压引擎 (Bandizip 或 WinRAR)")
 
     def tearDown(self):
         self.cfg.set("output_mode", self._orig_output_mode)

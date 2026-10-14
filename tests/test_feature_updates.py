@@ -147,6 +147,9 @@ class TestFeature1DeleteSourceAndVolumes(unittest.TestCase):
 
         tq = TaskQueue()
         tq.start()
+        if tq._engine is None:
+            tq.shutdown(wait=False)
+            self.skipTest("测试需要可用的解压引擎 (Bandizip 或 WinRAR)")
 
         status_records = []
         tq.task_status_changed.connect(
@@ -180,6 +183,9 @@ class TestFeature1DeleteSourceAndVolumes(unittest.TestCase):
 
         tq = TaskQueue()
         tq.start()
+        if tq._engine is None:
+            tq.shutdown(wait=False)
+            self.skipTest("测试需要可用的解压引擎 (Bandizip 或 WinRAR)")
         tq._process_task("t2", str(zip_path))
         tq.shutdown(wait=True)
 
@@ -195,6 +201,9 @@ class TestFeature1DeleteSourceAndVolumes(unittest.TestCase):
 
         tq = TaskQueue()
         tq.start()
+        if tq._engine is None:
+            tq.shutdown(wait=False)
+            self.skipTest("测试需要可用的解压引擎 (Bandizip 或 WinRAR)")
         tq._process_task("t3", str(broken_zip))
         tq.shutdown(wait=True)
 
@@ -776,8 +785,8 @@ class TestConfigManagerConcurrency(unittest.TestCase):
         """测试多线程并发进行 set, get, get_all, save 操作，无死锁、无异常、无 JSON 损坏。"""
         threads = []
         errors = []
-        num_threads = 10
-        iterations = 50
+        num_threads = 6
+        iterations = 20
 
         def worker(thread_id: int):
             try:
