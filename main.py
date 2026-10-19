@@ -1,5 +1,5 @@
 """
-懒人解压😋 (ShellBreaker) — 程序入口
+便捷解压 (ShellBreaker) — 程序入口
 负责全局日志配置、异常兜底、样式加载，启动主窗口。
 """
 import sys
@@ -84,7 +84,7 @@ sys.excepthook = _global_exception_hook
 # --------------- 启动入口 ---------------
 def main():
     logger.info("=" * 50)
-    logger.info("懒人解压😋 (ShellBreaker) 启动")
+    logger.info("便捷解压 (ShellBreaker) 启动")
     logger.info(f"日志文件: {LOG_FILE}")
 
     # 高 DPI 支持
@@ -93,15 +93,11 @@ def main():
     )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("懒人解压😋")
+    app.setApplicationName("便捷解压")
 
-    # ---------- 加载全局样式 (QSS) ----------
-    qss_path = _find_asset("style.qss")
-    if qss_path is not None:
-        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
-        logger.info(f"QSS 样式表已加载: {qss_path}")
-    else:
-        logger.warning("未找到 QSS 样式表，使用默认外观")
+    # ---------- 加载全局主题与样式 (V2 Fluent) ----------
+    from ui.theme.theme_manager import ensure_theme
+    ensure_theme(app)
 
     # ---------- 设置应用图标 ----------
     icon_path = _find_asset("app_icon.png")

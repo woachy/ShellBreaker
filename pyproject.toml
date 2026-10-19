@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ShellBreaker"
-version = "1.0.6"
+version = "1.1.0"
 description = "Windows 批量智能解压工具 —— 专治反复嵌套压缩、改后缀伪装与加密资源"
 readme = "README.md"
 requires-python = ">=3.10"
