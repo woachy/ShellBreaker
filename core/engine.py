@@ -6,6 +6,7 @@
 import subprocess
 import logging
 import os
+import threading
 from pathlib import Path
 from enum import Enum, auto
 from typing import Optional
@@ -15,6 +16,7 @@ from core.exceptions import (
     PasswordRequiredError,
     WrongPasswordError,
     ExtractionFailedError,
+    ExtractionAbortedError,
 )
 
 logger = logging.getLogger("ShellBreaker.Engine")
@@ -51,6 +53,9 @@ class BaseEngine:
         self.exe_path = str(Path(exe_path).resolve())
         if not os.path.isfile(self.exe_path):
             raise EngineNotFoundError(self.exe_path)
+        self._active_processes: dict[str, subprocess.Popen] = {}
+        self._lock = threading.Lock()
+        self._aborted_task_ids: set[str] = set()
 
     def extract(
         self,
@@ -58,6 +63,7 @@ class BaseEngine:
         dest: str | Path,
         password: Optional[str] = None,
         timeout: int = 300,
+        task_id: Optional[str] = None,
     ) -> Path:
         raise NotImplementedError
 
@@ -67,28 +73,96 @@ class BaseEngine:
         dest: str | Path,
         password: Optional[str] = None,
         timeout: int = 600,
+        task_id: Optional[str] = None,
     ) -> Path:
-        return self.extract(archive, dest, password=password, timeout=timeout)
+        return self.extract(archive, dest, password=password, timeout=timeout, task_id=task_id)
 
-    def _run_command(self, cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
+    def terminate_process(self, task_id: str):
+        """中止指定任务对应的活跃引擎子进程。"""
+        with self._lock:
+            self._aborted_task_ids.add(task_id)
+            proc = self._active_processes.get(task_id)
+        if proc is not None:
+            try:
+                logger.info(f"正在强行终止任务 [{task_id}] 引擎子进程 (pid={proc.pid})")
+                proc.kill()
+            except Exception as e:
+                logger.warning(f"终止任务 [{task_id}] 子进程异常: {e}")
+
+    def reset_abort(self, task_id: str):
+        """重置任务的中止状态（用于重新解压）。"""
+        with self._lock:
+            self._aborted_task_ids.discard(task_id)
+            self._active_processes.pop(task_id, None)
+
+    def is_aborted(self, task_id: str) -> bool:
+        """检查任务是否已被中止。"""
+        with self._lock:
+            return task_id in self._aborted_task_ids
+
+    def _run_command(
+        self, cmd: list[str], timeout: int, task_id: Optional[str] = None
+    ) -> subprocess.CompletedProcess:
         logger.debug(f"执行命令: {cmd}")
+        if task_id:
+            with self._lock:
+                if task_id in self._aborted_task_ids:
+                    raise ExtractionAbortedError(task_id, "任务已被用户中止")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+        if task_id:
+            with self._lock:
+                if task_id in self._aborted_task_ids:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise ExtractionAbortedError(task_id, "任务已被用户中止")
+                self._active_processes[task_id] = proc
+
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=timeout,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            logger.debug(f"引擎退出码: {result.returncode}")
-            if result.stdout:
-                logger.debug(f"引擎 stdout (前200): {result.stdout[:200]}")
-            if result.stderr:
-                logger.debug(f"引擎 stderr (前200): {result.stderr[:200]}")
-            return result
-        except subprocess.TimeoutExpired as e:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            retcode = proc.returncode
+            logger.debug(f"引擎退出码: {retcode}")
+            if stdout:
+                logger.debug(f"引擎 stdout (前200): {stdout[:200]}")
+            if stderr:
+                logger.debug(f"引擎 stderr (前200): {stderr[:200]}")
+
+            if task_id:
+                with self._lock:
+                    if task_id in self._aborted_task_ids:
+                        raise ExtractionAbortedError(task_id, "任务已被用户中止")
+
+            return subprocess.CompletedProcess(cmd, retcode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            if task_id:
+                with self._lock:
+                    if task_id in self._aborted_task_ids:
+                        raise ExtractionAbortedError(task_id, "任务已被用户中止")
             raise ExtractionFailedError(str(cmd[-1] if cmd else "?"), -1, f"解压超时 ({timeout}s)")
+        except ExtractionAbortedError:
+            raise
+        except Exception:
+            if task_id:
+                with self._lock:
+                    if task_id in self._aborted_task_ids:
+                        raise ExtractionAbortedError(task_id, "任务已被用户中止")
+            raise
+        finally:
+            if task_id:
+                with self._lock:
+                    self._active_processes.pop(task_id, None)
 
     @staticmethod
     def _classify_result(
@@ -145,6 +219,7 @@ class BandizipEngine(BaseEngine):
         dest: str | Path,
         password: Optional[str] = None,
         timeout: int = 300,
+        task_id: Optional[str] = None,
     ) -> Path:
         archive_str = str(Path(archive).resolve())
         dest_str = str(Path(dest).resolve())
@@ -160,7 +235,7 @@ class BandizipEngine(BaseEngine):
         if password:
             cmd.insert(-1, "-p:" + password)
 
-        result = self._run_command(cmd, timeout)
+        result = self._run_command(cmd, timeout, task_id=task_id)
 
         if result.returncode != 0:
             self._classify_result(result, archive_str, pw_provided, password or "")
@@ -174,6 +249,7 @@ class BandizipEngine(BaseEngine):
         dest: str | Path,
         password: Optional[str] = None,
         timeout: int = 600,
+        task_id: Optional[str] = None,
     ) -> Path:
         archive_str = str(Path(archive).resolve())
         dest_str = str(Path(dest).resolve())
@@ -188,7 +264,7 @@ class BandizipEngine(BaseEngine):
         if password:
             cmd.insert(-1, "-p:" + password)
 
-        result = self._run_command(cmd, timeout)
+        result = self._run_command(cmd, timeout, task_id=task_id)
 
         if result.returncode != 0:
             self._classify_result(result, archive_str, pw_provided, password or "")
@@ -206,6 +282,7 @@ class WinRAREngine(BaseEngine):
         dest: str | Path,
         password: Optional[str] = None,
         timeout: int = 300,
+        task_id: Optional[str] = None,
     ) -> Path:
         archive_str = str(Path(archive).resolve())
         dest_str = str(Path(dest).resolve())
@@ -221,7 +298,7 @@ class WinRAREngine(BaseEngine):
         else:
             cmd.insert(-2, "-p-")
 
-        result = self._run_command(cmd, timeout)
+        result = self._run_command(cmd, timeout, task_id=task_id)
 
         if result.returncode != 0:
             self._classify_exit_code(result, archive_str, pw_provided, password or "")
@@ -269,6 +346,7 @@ class WinRAREngine(BaseEngine):
         dest: str | Path,
         password: Optional[str] = None,
         timeout: int = 600,
+        task_id: Optional[str] = None,
     ) -> Path:
         archive_path = Path(archive).resolve()
         archive_str = str(archive_path)
@@ -286,7 +364,7 @@ class WinRAREngine(BaseEngine):
         else:
             repair_cmd.insert(-2, "-p-")
         logger.info(f"WinRAR 执行修复: {repair_cmd}")
-        self._run_command(repair_cmd, timeout=min(timeout, 300))
+        self._run_command(repair_cmd, timeout=min(timeout, 300), task_id=task_id)
 
         repaired_archive = None
         for f in repaired_dir.iterdir():
@@ -296,10 +374,10 @@ class WinRAREngine(BaseEngine):
 
         if repaired_archive is None:
             logger.warning("WinRAR repair 未生成修复文件，降级为普通提取")
-            return self.extract(archive_str, dest_str, password=password, timeout=timeout)
+            return self.extract(archive_str, dest_str, password=password, timeout=timeout, task_id=task_id)
 
         logger.info(f"WinRAR 修复文件: {repaired_archive}")
-        return self.extract(str(repaired_archive), dest_str, password=password, timeout=timeout)
+        return self.extract(str(repaired_archive), dest_str, password=password, timeout=timeout, task_id=task_id)
 
 
 # ---------- 引擎工厂 ----------

@@ -75,6 +75,7 @@ STATUS_COLORS = {
     "验证密码": "#9D5D00",
     "排队中": "#5D5D5D",
     "已跳过": "#9D5D00",
+    "已中止": "#C42B1C",
 }
 _DEFAULT_STATUS_COLOR = "#16212B"
 
@@ -698,19 +699,28 @@ class MainWindow(QMainWindow):
         has_valid_src = bool(src_path and os.path.exists(os.path.normpath(src_path)))
         act_open.setEnabled(has_valid_target or has_valid_src)
 
-        # 2. 复制输出路径
+        # 2. 打开源路径
+        act_open_source = menu.addAction(glyph_icon(ICON_FOLDER, theme.text2, 16), "打开源路径")
+        act_open_source.setEnabled(has_valid_src)
+
+        # 3. 复制输出路径
         act_copy = menu.addAction(glyph_icon(ICON_FILE, theme.text2, 16), "复制输出路径")
         copy_candidate = target_path or (remark if status.startswith("成功") else "") or src_path
         act_copy.setEnabled(bool(copy_candidate))
 
         menu.addSeparator()
 
-        # 3. 重新解压
+        # 4. 中止解压
+        act_abort = menu.addAction(glyph_icon(ICON_CLEAN, theme.danger, 16), "中止解压")
+        is_in_progress = status in ("正在提取", "验证密码", "排队中") or "正在" in status
+        act_abort.setEnabled(is_in_progress)
+
+        # 5. 重新解压
         act_retry = menu.addAction(glyph_icon(ICON_REFRESH, theme.text2, 16), "重新解压")
-        can_retry = (status.startswith("失败") or "跳过" in status) and bool(src_path) and os.path.exists(src_path)
+        can_retry = (status.startswith("失败") or "跳过" in status or "中止" in status) and bool(src_path) and os.path.exists(src_path)
         act_retry.setEnabled(can_retry)
 
-        # 4. 从列表中移除
+        # 6. 从列表中移除
         act_remove = menu.addAction(glyph_icon(ICON_CLEAN, theme.danger, 16), "从列表中移除")
 
         selected_action = menu.exec(self._table.viewport().mapToGlobal(pos))
@@ -728,15 +738,36 @@ class MainWindow(QMainWindow):
                 p = os.path.normpath(src_path)
                 subprocess.Popen(["explorer", f"/select,{p}"])
 
+        elif selected_action == act_open_source:
+            if has_valid_src:
+                try:
+                    p = os.path.normpath(src_path)
+                    if os.path.isdir(p):
+                        os.startfile(p)
+                    else:
+                        subprocess.Popen(["explorer", f"/select,{p}"])
+                    logger.info(f"已在资源管理器中定位源路径: {p}")
+                except Exception as e:
+                    logger.error(f"无法在资源管理器中定位源路径 ({src_path}): {e}")
+                    QMessageBox.warning(self, "打开失败", f"无法打开源路径:\n{src_path}\n错误: {e}")
+
         elif selected_action == act_copy:
             QGuiApplication.clipboard().setText(copy_candidate)
             logger.info(f"已复制路径到剪贴板: {copy_candidate}")
+
+        elif selected_action == act_abort:
+            self._abort_task(task_id)
 
         elif selected_action == act_retry:
             self._retry_task(row, task_id)
 
         elif selected_action == act_remove:
             self._remove_task_row(row, task_id)
+
+    def _abort_task(self, task_id: str):
+        """中止指定的任务。"""
+        logger.info(f"UI 触发中止任务: {task_id}")
+        self._task_queue.abort_task(task_id)
 
     def _retry_task(self, row: int, task_id: str):
         """重新解压任务。"""
@@ -804,7 +835,7 @@ class MainWindow(QMainWindow):
                 continue
             if st.startswith("成功"):
                 success += 1
-            elif st.startswith("失败"):
+            elif st.startswith("失败") or "中止" in st:
                 failed += 1
             elif "跳过" in st:
                 skipped += 1

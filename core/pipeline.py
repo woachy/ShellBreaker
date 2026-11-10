@@ -14,6 +14,7 @@ from core.exceptions import (
     ZipBombDetectedError,
     ExtractionFailedError,
     SandboxError,
+    ExtractionAbortedError,
 )
 from core.sandbox import (
     SandboxManager,
@@ -54,6 +55,7 @@ class ExtractionPipeline:
         on_password_needed: Optional[Callable[[str, str], None]] = None,
         on_password_wrong: Optional[Callable[[str], None]] = None,
         wait_for_password: Optional[Callable[[str], Optional[str]]] = None,
+        is_aborted: Optional[Callable[[str], bool]] = None,
     ):
         self._engine = engine
         self._engine_name = engine_name
@@ -66,6 +68,7 @@ class ExtractionPipeline:
         self._on_password_needed = on_password_needed
         self._on_password_wrong = on_password_wrong
         self._wait_for_password = wait_for_password
+        self._is_aborted = is_aborted
 
     # ---------- 回调封装 ----------
 
@@ -90,6 +93,13 @@ class ExtractionPipeline:
             return self._wait_for_password(task_id)
         return None
 
+    def _check_aborted(self, task_id: str):
+        """检查任务是否已被中止，若是则抛出 ExtractionAbortedError。"""
+        if self._is_aborted and self._is_aborted(task_id):
+            raise ExtractionAbortedError(task_id, "用户手动中止")
+        if self._engine is not None and hasattr(self._engine, "is_aborted") and self._engine.is_aborted(task_id):
+            raise ExtractionAbortedError(task_id, "用户手动中止")
+
     # ---------- 核心解压流程 ----------
 
     def process(self, task_id: str, src_path: str) -> bool:
@@ -104,6 +114,7 @@ class ExtractionPipeline:
         fail_reason = ""
 
         try:
+            self._check_aborted(task_id)
             src_name = os.path.basename(src_path)
             logger.info(f"[{task_id}] 开始处理: {src_path}")
 
@@ -114,6 +125,7 @@ class ExtractionPipeline:
             self._notify_status(task_id, src_name, "正在提取", name, "")
 
             # Step 1: 沙箱
+            self._check_aborted(task_id)
             sandbox_dir = self._sandbox.create_sandbox(src_path)
 
             # Step 2: 加载密码库
@@ -121,21 +133,29 @@ class ExtractionPipeline:
             passwords = [r["password"] for r in self._pwd_mgr.get_all()]
 
             # Step 3: 文件准备（铁律四：伪装包 shutil.copy 到沙箱并重命名为 .zip）
+            self._check_aborted(task_id)
             actual_file = self._sandbox.prepare_file(src_path, sandbox_dir)
 
             # Step 4: 降维试错链
+            self._check_aborted(task_id)
             dest_dir = str(sandbox_dir / "output")
             self.fallback_extract(task_id, actual_file, dest_dir, passwords, cleanup_files, sandbox_dir)
 
             # Step 4: 嵌套解压
+            self._check_aborted(task_id)
+            self._notify_status(task_id, "", "正在提取", self._engine_name, "")
             self._notify_progress(task_id, "正在扫描嵌套压缩包...")
             self.extract_nested(task_id, sandbox_dir, dest_dir, passwords, depth=1)
 
             # Step 4.3: 容器提权（将最终数据体搬运至根目录，清理沿途空壳）
+            self._check_aborted(task_id)
+            self._notify_status(task_id, "", "正在提取", self._engine_name, "")
             self._notify_progress(task_id, "正在整理目录结构...")
             SandboxManager.promote_content(Path(dest_dir))
 
             # Step 4.5: 搬运到用户目标路径（最后一公里）
+            self._check_aborted(task_id)
+            self._notify_status(task_id, "", "正在提取", self._engine_name, "")
             self._notify_progress(task_id, "正在搬运到目标路径...")
             final_path = self._sandbox.deliver_to_target(src_path, sandbox_dir)
             dest_dir = final_path
@@ -151,6 +171,9 @@ class ExtractionPipeline:
             success = True
             logger.info(f"[{task_id}] [交付成功] 文件已移动至: {final_path}")
 
+        except ExtractionAbortedError as e:
+            fail_reason = "用户手动中止"
+            logger.info(f"[{task_id}] 任务已被中止: {e}")
         except PasswordRequiredError as e:
             fail_reason = "需要密码，且用户未提供"
             logger.warning(f"[{task_id}] {fail_reason}: {e}")
@@ -180,6 +203,11 @@ class ExtractionPipeline:
                 self._notify_status(
                     task_id, os.path.basename(src_path), "成功",
                     self._engine_name, dest_dir,
+                )
+            elif fail_reason == "用户手动中止":
+                self._notify_status(
+                    task_id, os.path.basename(src_path), "已中止",
+                    self._engine_name, "用户手动中止",
                 )
             else:
                 self._notify_status(
@@ -279,17 +307,20 @@ class ExtractionPipeline:
     def extract_with_smart_passwords(
         self, task_id: str, archive: Path, dest: str, passwords: list[str], label: str = "",
     ):
+        self._check_aborted(task_id)
         archive_str = str(archive)
-        self._notify_status(task_id, "", "验证密码", self._engine_name, "")
+        self._notify_status(task_id, "", "正在提取", self._engine_name, "")
 
         had_password_issue = False
         last_failed_err: Optional[ExtractionFailedError] = None
 
-        # 1) 无密码
+        # 1) 无密码（正常的直接提取阶段）
         try:
-            self._engine.extract(archive_str, dest, password=None)
+            self._engine.extract(archive_str, dest, password=None, task_id=task_id)
             logger.info(f"[{task_id}] {label} 无密码解压成功")
             return
+        except ExtractionAbortedError:
+            raise
         except PasswordRequiredError:
             logger.info(f"[{task_id}] {label} 需要密码")
             had_password_issue = True
@@ -300,14 +331,20 @@ class ExtractionPipeline:
         except ExtractionFailedError as e:
             last_failed_err = e
 
-        # 2) 遍历 JSON 密码库
+        # 2) 遍历 JSON 密码库（真正进入密码尝试阶段，才设为“验证密码”）
+        if passwords:
+            self._notify_status(task_id, "", "验证密码", self._engine_name, "")
         for i, pwd in enumerate(passwords):
+            self._check_aborted(task_id)
             self._notify_progress(task_id, f"{label} 尝试密码 ({i+1}/{len(passwords)})...")
             try:
-                self._engine.extract(archive_str, dest, password=pwd)
+                self._engine.extract(archive_str, dest, password=pwd, task_id=task_id)
                 logger.info(f"[{task_id}] {label} 密码 #{i+1} 匹配成功")
                 self._pwd_mgr.record_hit(pwd)
+                self._notify_status(task_id, "", "正在提取", self._engine_name, "")
                 return
+            except ExtractionAbortedError:
+                raise
             except WrongPasswordError:
                 had_password_issue = True
                 continue
@@ -330,18 +367,23 @@ class ExtractionPipeline:
         self._notify_password_needed(task_id, archive.name)
 
         while True:
+            self._check_aborted(task_id)
             user_pwd = self._wait_password(task_id)
+            self._check_aborted(task_id)
             if user_pwd is None:
                 raise PasswordRequiredError(archive_str, "用户取消密码输入")
 
             try:
-                self._engine.extract(archive_str, dest, password=user_pwd)
+                self._engine.extract(archive_str, dest, password=user_pwd, task_id=task_id)
                 logger.info(f"[{task_id}] {label} 用户密码匹配成功")
                 self._pwd_mgr.record_hit(user_pwd)
                 if user_pwd not in passwords:
                     passwords.append(user_pwd)
                 self._notify_progress(task_id, "密码已自动入库 ✅")
+                self._notify_status(task_id, "", "正在提取", self._engine_name, "")
                 return
+            except ExtractionAbortedError:
+                raise
             except WrongPasswordError:
                 # 密码错误 → 通知 UI 弹错误提示，继续循环
                 logger.info(f"[{task_id}] {label} 用户密码错误，允许重试")
@@ -356,16 +398,19 @@ class ExtractionPipeline:
     def repair_with_smart_passwords(
         self, task_id: str, archive: Path, dest: str, passwords: list[str],
     ):
+        self._check_aborted(task_id)
         archive_str = str(archive)
-        self._notify_status(task_id, "", "验证密码", self._engine_name, "")
+        self._notify_status(task_id, "", "正在提取", self._engine_name, "")
 
         had_password_issue = False
         last_failed_err: Optional[ExtractionFailedError] = None
 
         try:
-            self._engine.repair_extract(archive_str, dest, password=None)
+            self._engine.repair_extract(archive_str, dest, password=None, task_id=task_id)
             logger.info(f"[{task_id}] repair 无密码成功")
             return
+        except ExtractionAbortedError:
+            raise
         except PasswordRequiredError:
             had_password_issue = True
         except WrongPasswordError:
@@ -374,13 +419,19 @@ class ExtractionPipeline:
         except ExtractionFailedError as e:
             last_failed_err = e
 
+        if passwords:
+            self._notify_status(task_id, "", "验证密码", self._engine_name, "")
         for i, pwd in enumerate(passwords):
+            self._check_aborted(task_id)
             self._notify_progress(task_id, f"repair 尝试密码 ({i+1}/{len(passwords)})...")
             try:
-                self._engine.repair_extract(archive_str, dest, password=pwd)
+                self._engine.repair_extract(archive_str, dest, password=pwd, task_id=task_id)
                 logger.info(f"[{task_id}] repair 密码 #{i+1} 匹配成功")
                 self._pwd_mgr.record_hit(pwd)
+                self._notify_status(task_id, "", "正在提取", self._engine_name, "")
                 return
+            except ExtractionAbortedError:
+                raise
             except WrongPasswordError:
                 had_password_issue = True
                 continue
@@ -401,18 +452,23 @@ class ExtractionPipeline:
         self._notify_password_needed(task_id, archive.name)
 
         while True:
+            self._check_aborted(task_id)
             user_pwd = self._wait_password(task_id)
+            self._check_aborted(task_id)
             if user_pwd is None:
                 raise PasswordRequiredError(archive_str, "用户取消密码输入")
 
             try:
-                self._engine.repair_extract(archive_str, dest, password=user_pwd)
+                self._engine.repair_extract(archive_str, dest, password=user_pwd, task_id=task_id)
                 logger.info(f"[{task_id}] repair 用户密码匹配成功")
                 self._pwd_mgr.record_hit(user_pwd)
                 if user_pwd not in passwords:
                     passwords.append(user_pwd)
                 self._notify_progress(task_id, "密码已自动入库 ✅")
+                self._notify_status(task_id, "", "正在提取", self._engine_name, "")
                 return
+            except ExtractionAbortedError:
+                raise
             except WrongPasswordError:
                 logger.info(f"[{task_id}] repair 用户密码错误，允许重试")
                 self._notify_password_wrong(task_id)
@@ -536,6 +592,7 @@ class ExtractionPipeline:
             return False
 
         # 9. 针对 temp_archive 进行解压尝试 (Trial Extraction)
+        self._check_aborted(task_id)
         self._notify_progress(task_id, f"尝试解压伪装包 (层{current_depth}): {temp_archive.name}")
         temp_dest = ensure_unique_path(parent_dir / f"_tmp_{temp_archive.stem}")
 
@@ -552,6 +609,14 @@ class ExtractionPipeline:
                     shutil.rmtree(str(temp_dest), ignore_errors=True)
                 skipped_archives.add(orig_candidate)
                 return False
+        except ExtractionAbortedError:
+            try:
+                os.replace(temp_archive, orig_candidate)
+            except OSError:
+                pass
+            if temp_dest.exists():
+                shutil.rmtree(str(temp_dest), ignore_errors=True)
+            raise
         except (PasswordRequiredError, WrongPasswordError, ExtractionFailedError) as e:
             logger.warning(f"[{task_id}] 伪装试解压失败/需密码 ({temp_archive.name}): {e}，触发核心回滚")
             # 【核心回滚】：立即将 temp_archive 还原重命名为原始文件名
@@ -605,6 +670,30 @@ class ExtractionPipeline:
 
         return True
 
+    @staticmethod
+    def _is_native_folder(path: Path) -> bool:
+        """
+        判断是否为业务原生文件夹：
+        定义为 is_dir()，且排除系统隐藏项、排除 _tmp_*、_repaired 等临时解压中转目录。
+        """
+        if not path.is_dir():
+            return False
+        name = path.name
+        if name in SandboxManager._SYSTEM_FILES:
+            return False
+        if name.startswith((".", "._", "_tmp_", "_repaired")):
+            return False
+        return True
+
+    def _get_native_folders(self, dir_path: Path) -> list[Path]:
+        """获取目录下的原生业务文件夹列表。"""
+        if not dir_path.exists() or not dir_path.is_dir():
+            return []
+        try:
+            return [child for child in dir_path.iterdir() if self._is_native_folder(child)]
+        except OSError:
+            return []
+
     def extract_nested(
         self,
         task_id: str,
@@ -620,8 +709,19 @@ class ExtractionPipeline:
         current_depth = depth
         skipped_archives: set[Path] = set()
 
+        # ===== 【底线熔断保护】检测当前 base 是否已存在原生业务文件夹 =====
+        # 用户底线：一旦本体解压出来（出现原生业务文件夹），立即停止一切嵌套解压行为，绝不下钻
+        native_dirs = self._get_native_folders(base)
+        if native_dirs:
+            logger.info(
+                f"[{task_id}] base 目录下已存在原生业务文件夹 ({[d.name for d in native_dirs]})，"
+                f"Data Body 已脱壳，触发绝对熔断，终止嵌套解压"
+            )
+            return
+
         # ===== 【多层嵌套消化循环】在当前 base 目录下持续循环处理暴露出的压缩包 =====
         while True:
+            self._check_aborted(task_id)
             if current_depth > MAX_NEST_DEPTH:
                 raise ZipBombDetectedError(str(sandbox_dir), current_depth)
 
@@ -638,12 +738,22 @@ class ExtractionPipeline:
                     base, skipped_archives, task_id, passwords, current_depth
                 )
                 if handled:
+                    # 检查伪装包解压产物中是否诞生了原生业务文件夹
+                    native_dirs = self._get_native_folders(base)
+                    if native_dirs:
+                        logger.info(
+                            f"[{task_id}] 伪装解压后检测到原生业务文件夹 "
+                            f"({[d.name for d in native_dirs]})，Data Body 已诞生脱壳，"
+                            f"触发绝对熔断，终止嵌套解压"
+                        )
+                        return
                     current_depth += 1
                     continue
                 else:
                     break
 
             for archive in archives:
+                self._check_aborted(task_id)
                 if not archive.exists():
                     continue
 
@@ -694,12 +804,20 @@ class ExtractionPipeline:
                     except OSError as e:
                         logger.warning(f"[{task_id}] 删除暂存目录失败 ({temp_dest}): {e}")
 
+                # 4. 关键底线：检查当前解压产物中是否诞生了原生业务文件夹，若是则立即绝对熔断！
+                native_dirs = self._get_native_folders(base)
+                if native_dirs:
+                    logger.info(
+                        f"[{task_id}] 解压 {archive.name} 后检测到原生业务文件夹 "
+                        f"({[d.name for d in native_dirs]})，Data Body 已诞生脱壳，"
+                        f"触发绝对熔断，终止后续一切解压行为"
+                    )
+                    return
+
             current_depth += 1
 
-        # ---- 递归进入子目录（逐个分支，不重复扫描 base_dest 根）-----
-        for subdir in sorted(base.iterdir()):
-            if subdir.is_dir():
-                self.extract_nested(task_id, sandbox_dir, str(subdir), passwords, current_depth)
+        # 注意：彻底移除原先向子目录无脑 extract_nested 递归遍历的代码
+        # 嵌套解压仅在外壳层（纯套娃壳）流转，绝不穿透业务本体！
 
     # ---------- 安全删除源文件与回收 ----------
 

@@ -47,6 +47,13 @@ class ExtractionFailedError(ShellBreakerError):
         super().__init__(f"解压失败 (exit={returncode}): {archive}")
 
 
+class ExtractionAbortedError(ShellBreakerError):
+    """解压任务被用户手动中止。"""
+    def __init__(self, task_id: str = "", message: str = "解压已被用户中止"):
+        self.task_id = task_id
+        super().__init__(message)
+
+
 class SandboxError(ShellBreakerError):
     """沙箱创建或文件操作失败。"""
     def __init__(self, message: str):

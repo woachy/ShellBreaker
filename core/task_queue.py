@@ -69,6 +69,8 @@ class TaskQueue(QObject):
 
         self._password_events: dict[str, threading.Event] = {}
         self._supplied_passwords: dict[str, Optional[str]] = {}
+        self._aborted_tasks: set[str] = set()
+        self._task_filenames: dict[str, str] = {}
         self._lock = threading.RLock()
 
     # ---------- 生命周期 ----------
@@ -140,6 +142,11 @@ class TaskQueue(QObject):
                 return None
 
         task_id = str(uuid.uuid4())[:8]
+        with self._lock:
+            self._aborted_tasks.discard(task_id)
+            self._task_filenames[task_id] = file_name
+            if self._engine:
+                self._engine.reset_abort(task_id)
         logger.info(f"任务已提交 [id={task_id}]: {src_path}")
         future = self._executor.submit(self._process_task, task_id, src_path)
         self._futures[future] = task_id
@@ -151,6 +158,12 @@ class TaskQueue(QObject):
         UI 层负责在调用前创建表格行并设置"排队中"状态。"""
         if not self._running:
             self.start()
+        file_name = os.path.basename(src_path)
+        with self._lock:
+            self._aborted_tasks.discard(task_id)
+            self._task_filenames[task_id] = file_name
+            if self._engine:
+                self._engine.reset_abort(task_id)
         logger.info(f"任务已提交 [id={task_id}]: {src_path}")
         future = self._executor.submit(self._process_task, task_id, src_path)
         self._futures[future] = task_id
@@ -245,6 +258,45 @@ class TaskQueue(QObject):
             self._password_events.pop(task_id, None)
             return self._supplied_passwords.pop(task_id, None)
 
+    # ---------- 中止与状态查询 ----------
+
+    def is_aborted(self, task_id: str) -> bool:
+        """检查指定任务是否已被用户中止。"""
+        with self._lock:
+            return task_id in self._aborted_tasks
+
+    def abort_task(self, task_id: str) -> bool:
+        """
+        中止指定 task_id 的任务。
+        若任务还在排队（Future 尚未运行）：调用 future.cancel()，从队列移除，并由调度器通知状态为 "已中止"，备注为 "排队中已中止"；
+        若任务正在运行：标记 aborted，唤醒等待密码的 threading.Event，并调用 self._engine.terminate_process(task_id)；
+        pipeline 检查到 aborted 或捕获进程被杀异常后抛出 ExtractionAbortedError，在 finally 中自动回收沙箱目录，通知状态为 "已中止"，备注为 "用户手动中止"。
+        返回是否成功触发中止。
+        """
+        logger.info(f"收到中止任务请求 [id={task_id}]")
+        with self._lock:
+            self._aborted_tasks.add(task_id)
+            target_future: Optional[Future] = None
+            for fut, tid in list(self._futures.items()):
+                if tid == task_id:
+                    target_future = fut
+                    break
+
+            if target_future is not None and target_future.cancel():
+                self._futures.pop(target_future, None)
+                fname = self._task_filenames.get(task_id, "")
+                logger.info(f"[{task_id}] 任务尚未开始运行，已从线程池队列取消")
+                self.task_status_changed.emit(task_id, fname, "已中止", self._engine_name, "排队中已中止")
+                self.task_progress.emit(task_id, "任务结束")
+                return True
+
+            # 任务正在运行
+            self.supply_password(task_id, None)
+            if self._engine is not None:
+                self._engine.terminate_process(task_id)
+
+            return True
+
     # ---------- 管线构建与单任务处理 ----------
 
     def _create_pipeline(self) -> ExtractionPipeline:
@@ -261,6 +313,7 @@ class TaskQueue(QObject):
             on_password_needed=self.password_needed.emit,
             on_password_wrong=self.password_wrong.emit,
             wait_for_password=self._wait_for_user_password,
+            is_aborted=self.is_aborted,
         )
 
     def _process_task(self, task_id: str, src_path: str):
@@ -271,8 +324,12 @@ class TaskQueue(QObject):
 
     def _on_task_done(self, future: Future):
         task_id = self._futures.pop(future, None)
-        if future.exception():
-            logger.error(f"[{task_id}] 任务异常: {future.exception()}")
+        if future.cancelled():
+            logger.info(f"[{task_id}] Future 已取消")
+            return
+        exc = future.exception()
+        if exc:
+            logger.error(f"[{task_id}] 任务异常: {exc}")
 
     # ---------- 向后兼容委托代理 ----------
 

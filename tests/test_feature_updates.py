@@ -11,24 +11,29 @@ import time
 import shutil
 import zipfile
 import threading
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QTableWidgetItem, QMenu
+from PySide6.QtCore import QPoint, Qt
 
 app = QApplication.instance() or QApplication(sys.argv)
 
 from core.sandbox import (
     SandboxManager,
+    SANDBOX_ROOT,
     is_primary_part,
     is_secondary_volume,
     get_part_group,
     send_to_recycle_bin,
     PROTECTED_ENDPOINT_EXTS,
 )
+from core.exceptions import ExtractionAbortedError
+from core.engine import BaseEngine
 from core.task_queue import TaskQueue
 from data.config_manager import ConfigManager
 from data.password_manager import (
@@ -742,6 +747,427 @@ class TestFeatureUIComponents(unittest.TestCase):
                     1,
                     "win._task_data 必须成功录入拖拽的 sample.zip 任务",
                 )
+        finally:
+            win.close()
+
+    def test_main_window_context_menu_open_source_path(self):
+        """测试任务列表右键菜单新增'打开源路径'选项及其启用/禁用与定位响应行为。"""
+        import os
+        from unittest.mock import patch
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtWidgets import QTableWidgetItem
+
+        win = self.MainWindow()
+        try:
+            valid_file = os.path.abspath("tests/conftest.py")
+            valid_dir = os.path.abspath("tests")
+            invalid_file = os.path.abspath("tests/non_existent_archive_xyz.zip")
+
+            # 任务1: 有效源文件 (file)
+            row0 = win._table.rowCount()
+            win._table.insertRow(row0)
+            item0 = QTableWidgetItem("conftest.py")
+            item0.setData(Qt.ItemDataRole.UserRole, "t_file")
+            win._table.setItem(row0, 0, item0)
+            win._table.setItem(row0, 1, QTableWidgetItem("解压完成"))
+            win._table.setItem(row0, 2, QTableWidgetItem("7-Zip"))
+            win._table.setItem(row0, 3, QTableWidgetItem("C:\\extracted"))
+            win._task_data["t_file"] = {
+                "src_path": valid_file,
+                "dest_path": "C:\\extracted",
+                "status": "解压完成",
+            }
+
+            # 任务2: 有效源目录 (dir)
+            row1 = win._table.rowCount()
+            win._table.insertRow(row1)
+            item1 = QTableWidgetItem("tests")
+            item1.setData(Qt.ItemDataRole.UserRole, "t_dir")
+            win._table.setItem(row1, 0, item1)
+            win._table.setItem(row1, 1, QTableWidgetItem("排队中"))
+            win._table.setItem(row1, 2, QTableWidgetItem(""))
+            win._table.setItem(row1, 3, QTableWidgetItem(""))
+            win._task_data["t_dir"] = {
+                "src_path": valid_dir,
+                "dest_path": "",
+                "status": "排队中",
+            }
+
+            # 任务3: 不存在的源文件 (invalid)
+            row2 = win._table.rowCount()
+            win._table.insertRow(row2)
+            item2 = QTableWidgetItem("ghost.zip")
+            item2.setData(Qt.ItemDataRole.UserRole, "t_invalid")
+            win._table.setItem(row2, 0, item2)
+            win._table.setItem(row2, 1, QTableWidgetItem("解压失败"))
+            win._table.setItem(row2, 2, QTableWidgetItem(""))
+            win._table.setItem(row2, 3, QTableWidgetItem("文件不存在"))
+            win._task_data["t_invalid"] = {
+                "src_path": invalid_file,
+                "dest_path": "",
+                "status": "解压失败",
+            }
+
+            captured_actions = {}
+            chosen_action_text = [None]
+
+            def custom_qmenu(*args, **kwargs):
+                from PySide6.QtWidgets import QMenu
+                m = QMenu(*args, **kwargs)
+                def fake_exec(*a, **k):
+                    captured_actions.clear()
+                    for act in m.actions():
+                        if act.text():
+                            captured_actions[act.text()] = act
+                    return captured_actions.get(chosen_action_text[0])
+                m.exec = fake_exec
+                return m
+
+            with patch("ui.main_window.QMenu", side_effect=custom_qmenu):
+                # 1. 验证源文件(file)："打开源路径"启用，点击后调用 explorer /select
+                chosen_action_text[0] = "打开源路径"
+                with patch("subprocess.Popen") as mock_popen, patch("os.startfile") as mock_startfile:
+                    pos0 = QPoint(10, win._table.rowViewportPosition(row0) + 5)
+                    win._on_table_context_menu(pos0)
+
+                    self.assertIn("打开所在目录", captured_actions)
+                    self.assertIn("打开源路径", captured_actions)
+                    self.assertIn("复制输出路径", captured_actions)
+                    self.assertIn("重新解压", captured_actions)
+                    self.assertIn("从列表中移除", captured_actions)
+
+                    self.assertTrue(captured_actions["打开源路径"].isEnabled())
+                    mock_popen.assert_called_once()
+                    mock_startfile.assert_not_called()
+                    cmd_args = mock_popen.call_args[0][0]
+                    self.assertEqual(cmd_args[0], "explorer")
+                    self.assertEqual(cmd_args[1], f"/select,{os.path.normpath(valid_file)}")
+
+                # 2. 验证源目录(dir)："打开源路径"启用，点击后调用 os.startfile
+                chosen_action_text[0] = "打开源路径"
+                with patch("subprocess.Popen") as mock_popen, patch("os.startfile") as mock_startfile:
+                    pos1 = QPoint(10, win._table.rowViewportPosition(row1) + 5)
+                    win._on_table_context_menu(pos1)
+
+                    self.assertTrue(captured_actions["打开源路径"].isEnabled())
+                    mock_startfile.assert_called_once_with(os.path.normpath(valid_dir))
+                    mock_popen.assert_not_called()
+
+                # 3. 验证源文件不存在："打开源路径"应禁用
+                chosen_action_text[0] = None
+                pos2 = QPoint(10, win._table.rowViewportPosition(row2) + 5)
+                win._on_table_context_menu(pos2)
+
+                self.assertIn("打开源路径", captured_actions)
+                self.assertFalse(captured_actions["打开源路径"].isEnabled())
+        finally:
+            win.close()
+
+
+class TestFeatureAbortExtraction(unittest.TestCase):
+    """新特性测试：中止解压与重新解压全流程验证。"""
+
+    def setUp(self):
+        self.scratch = PROJECT_ROOT / "tests" / "test_scratch_abort"
+        if self.scratch.exists():
+            shutil.rmtree(self.scratch, ignore_errors=True)
+        self.scratch.mkdir(parents=True, exist_ok=True)
+
+        self.cfg = ConfigManager()
+        self._orig_mode = self.cfg.get("output_mode")
+        self._orig_custom = self.cfg.get("custom_output_path")
+        self._orig_workers = self.cfg.get("max_workers")
+        self._orig_min_size = self.cfg.get("min_file_size_mb")
+        self.cfg.set("output_mode", "source_directory")
+        self.cfg.set("custom_output_path", "")
+        self.cfg.set("min_file_size_mb", 0)
+
+    def tearDown(self):
+        self.cfg.set("output_mode", self._orig_mode)
+        self.cfg.set("custom_output_path", self._orig_custom)
+        self.cfg.set("max_workers", self._orig_workers)
+        self.cfg.set("min_file_size_mb", self._orig_min_size)
+        if self.scratch.exists():
+            shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def test_abort_queued_task(self):
+        """验证 abort_task 在排队状态下（尚未执行）能够被成功取消，并通知“已中止”与“排队中已中止”。"""
+        self.cfg.set("max_workers", 1)
+        tq = TaskQueue()
+        tq.start()
+
+        # 创建两个有效压缩包
+        zip1 = self.scratch / "task1.zip"
+        zip2 = self.scratch / "task2.zip"
+        with zipfile.ZipFile(zip1, "w") as zf:
+            zf.writestr("a.txt", "111")
+        with zipfile.ZipFile(zip2, "w") as zf:
+            zf.writestr("b.txt", "222")
+
+        status_records = []
+        tq.task_status_changed.connect(
+            lambda tid, fn, status, eng, remark: status_records.append((tid, status, remark))
+        )
+
+        block_event = threading.Event()
+        original_process = tq._process_task
+
+        def blocking_process(tid, src):
+            if tid == "t1":
+                block_event.wait(timeout=5)
+            return original_process(tid, src)
+
+        with patch.object(tq, "_process_task", side_effect=blocking_process):
+            tq.submit_existing("t1", str(zip1))
+            time.sleep(0.1)
+
+            tq.submit_existing("t2", str(zip2))
+
+            success = tq.abort_task("t2")
+            self.assertTrue(success)
+            self.assertTrue(tq.is_aborted("t2"))
+
+            block_event.set()
+            tq.shutdown(wait=True)
+
+        t2_records = [r for r in status_records if r[0] == "t2"]
+        self.assertTrue(any(st == "已中止" and "排队中已中止" in rm for _, st, rm in t2_records))
+
+    def test_abort_running_task_and_sandbox_cleanup(self):
+        """验证 abort_task 在运行状态下中止，沙箱临时文件被完整清理且未污染用户交付目录。"""
+        tq = TaskQueue()
+        tq.start()
+
+        zip_path = self.scratch / "test_running.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("secret.txt", "content")
+
+        status_records = []
+        tq.task_status_changed.connect(
+            lambda tid, fn, status, eng, remark: status_records.append((tid, status, remark))
+        )
+
+        class MockSlowEngine(BaseEngine):
+            def __init__(self):
+                super().__init__(sys.executable)
+                self.extract_started = threading.Event()
+
+            def extract(self, archive, dest, password=None, timeout=300, task_id=None):
+                self.extract_started.set()
+                dest_p = Path(dest)
+                dest_p.mkdir(parents=True, exist_ok=True)
+                (dest_p / "half_extracted.bin").write_bytes(b"half data" * 1024)
+                for _ in range(50):
+                    if self.is_aborted(task_id):
+                        raise ExtractionAbortedError(task_id, "用户手动中止")
+                    time.sleep(0.05)
+                return dest_p
+
+        mock_eng = MockSlowEngine()
+        tq._engine = mock_eng
+        tq._engine_name = "MockSlow"
+
+        tid = "t_run"
+        t = threading.Thread(target=tq._process_task, args=(tid, str(zip_path)))
+        t.start()
+
+        self.assertTrue(mock_eng.extract_started.wait(timeout=5))
+
+        sandboxes_before = list(SANDBOX_ROOT.glob("test_running*"))
+        self.assertTrue(len(sandboxes_before) > 0, "解压中途沙箱临时目录应当存在")
+
+        aborted_ok = tq.abort_task(tid)
+        self.assertTrue(aborted_ok)
+        t.join(timeout=5)
+        tq.shutdown(wait=False)
+        app.processEvents()
+
+        t_records = [r for r in status_records if r[0] == tid]
+        self.assertTrue(any(st == "已中止" and "用户手动中止" in rm for _, st, rm in t_records))
+
+        sandboxes_after = [d for d in SANDBOX_ROOT.glob("test_running*") if d.is_dir()]
+        self.assertEqual(len(sandboxes_after), 0, "任务中止后沙箱临时目录必须被完全删除清理")
+
+        delivered_output = self.scratch / "test_running"
+        self.assertFalse(delivered_output.exists(), "任务中止后绝不能搬运交付到用户目录")
+
+    def test_engine_process_termination(self):
+        """验证 BaseEngine 的 terminate_process 能够秒级强杀子进程并抛出 ExtractionAbortedError。"""
+        engine = BaseEngine(sys.executable)
+        task_id = "test_kill_proc"
+
+        cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+
+        err_holder = []
+        def run_proc():
+            try:
+                engine._run_command(cmd, timeout=30, task_id=task_id)
+            except Exception as e:
+                err_holder.append(e)
+
+        worker = threading.Thread(target=run_proc)
+        worker.start()
+
+        t0 = time.time()
+        while time.time() - t0 < 3.0:
+            if task_id in engine._active_processes:
+                break
+            time.sleep(0.05)
+
+        self.assertIn(task_id, engine._active_processes)
+
+        engine.terminate_process(task_id)
+        worker.join(timeout=3.0)
+        self.assertFalse(worker.is_alive(), "子进程应当在秒级内被终止")
+
+        self.assertEqual(len(err_holder), 1)
+        self.assertIsInstance(err_holder[0], ExtractionAbortedError)
+        self.assertNotIn(task_id, engine._active_processes)
+
+    def test_main_window_abort_menu_action_and_retry(self):
+        """验证 UI 界面右键菜单中“中止解压”的启用条件、点击响应，以及中止后“重新解压”功能。"""
+        from ui.main_window import MainWindow
+        win = MainWindow()
+        try:
+            valid_src = str((self.scratch / "dummy.zip").resolve())
+            Path(valid_src).write_text("dummy", encoding="utf-8")
+
+            # 行 0: "正在提取"
+            win._table.insertRow(0)
+            item0 = QTableWidgetItem("正在提取.zip")
+            item0.setData(Qt.ItemDataRole.UserRole, "t_running")
+            win._table.setItem(0, 0, item0)
+            win._table.setItem(0, 1, QTableWidgetItem("正在提取"))
+            win._table.setItem(0, 2, QTableWidgetItem("WinRAR"))
+            win._table.setItem(0, 3, QTableWidgetItem("正在解压..."))
+            win._task_data["t_running"] = {
+                "src_path": valid_src,
+                "filename": "正在提取.zip",
+                "status": "正在提取",
+                "engine": "WinRAR",
+                "dest_path": "",
+                "remark": "",
+            }
+
+            # 行 1: "排队中"
+            win._table.insertRow(1)
+            item1 = QTableWidgetItem("排队中.zip")
+            item1.setData(Qt.ItemDataRole.UserRole, "t_queued")
+            win._table.setItem(1, 0, item1)
+            win._table.setItem(1, 1, QTableWidgetItem("排队中"))
+            win._table.setItem(1, 2, QTableWidgetItem(""))
+            win._table.setItem(1, 3, QTableWidgetItem(""))
+            win._task_data["t_queued"] = {
+                "src_path": valid_src,
+                "filename": "排队中.zip",
+                "status": "排队中",
+                "engine": "",
+                "dest_path": "",
+                "remark": "",
+            }
+
+            # 行 2: "已中止"
+            win._table.insertRow(2)
+            item2 = QTableWidgetItem("已中止.zip")
+            item2.setData(Qt.ItemDataRole.UserRole, "t_aborted")
+            win._table.setItem(2, 0, item2)
+            win._table.setItem(2, 1, QTableWidgetItem("已中止"))
+            win._table.setItem(2, 2, QTableWidgetItem("WinRAR"))
+            win._table.setItem(2, 3, QTableWidgetItem("用户手动中止"))
+            win._task_data["t_aborted"] = {
+                "src_path": valid_src,
+                "filename": "已中止.zip",
+                "status": "已中止",
+                "engine": "WinRAR",
+                "dest_path": "",
+                "remark": "用户手动中止",
+            }
+
+            # 行 3: "成功"
+            win._table.insertRow(3)
+            item3 = QTableWidgetItem("成功.zip")
+            item3.setData(Qt.ItemDataRole.UserRole, "t_success")
+            win._table.setItem(3, 0, item3)
+            win._table.setItem(3, 1, QTableWidgetItem("成功"))
+            win._table.setItem(3, 2, QTableWidgetItem("WinRAR"))
+            win._table.setItem(3, 3, QTableWidgetItem(str(self.scratch)))
+            win._task_data["t_success"] = {
+                "src_path": valid_src,
+                "filename": "成功.zip",
+                "status": "成功",
+                "engine": "WinRAR",
+                "dest_path": str(self.scratch),
+                "remark": str(self.scratch),
+            }
+
+            # 验证统计前的数据（中止计入 failed/非处理中）
+            win._update_statistics()
+            self.assertEqual(win._lbl_stats.text(), "共 4 个任务")
+            labels = win.tasks_page.status_bar._labels
+            self.assertEqual(labels["success"].text(), "成功 1")
+            self.assertEqual(labels["failed"].text(), "失败 1")
+            self.assertEqual(labels["running"].text(), "处理中 2")
+
+            captured_actions = {}
+            chosen_action_text = [None]
+
+            def custom_qmenu(*args, **kwargs):
+                from PySide6.QtWidgets import QMenu
+                m = QMenu(*args, **kwargs)
+                def fake_exec(*a, **k):
+                    captured_actions.clear()
+                    for act in m.actions():
+                        if act.text():
+                            captured_actions[act.text()] = act
+                    return captured_actions.get(chosen_action_text[0])
+                m.exec = fake_exec
+                return m
+
+            with patch("ui.main_window.QMenu", side_effect=custom_qmenu):
+                # 1. 验证“正在提取”行：中止解压为 True，重新解压为 False
+                pos0 = QPoint(10, win._table.rowViewportPosition(0) + 5)
+                win._on_table_context_menu(pos0)
+                self.assertIn("中止解压", captured_actions)
+                self.assertTrue(captured_actions["中止解压"].isEnabled())
+                self.assertFalse(captured_actions["重新解压"].isEnabled())
+
+                # 2. 验证“排队中”行：中止解压为 True
+                pos1 = QPoint(10, win._table.rowViewportPosition(1) + 5)
+                win._on_table_context_menu(pos1)
+                self.assertTrue(captured_actions["中止解压"].isEnabled())
+
+                # 3. 验证“已中止”行：中止解压为 False，重新解压为 True！
+                pos2 = QPoint(10, win._table.rowViewportPosition(2) + 5)
+                win._on_table_context_menu(pos2)
+                self.assertFalse(captured_actions["中止解压"].isEnabled())
+                self.assertTrue(captured_actions["重新解压"].isEnabled())
+
+                # 4. 验证“成功”行：中止解压为 False，重新解压为 False
+                pos3 = QPoint(10, win._table.rowViewportPosition(3) + 5)
+                win._on_table_context_menu(pos3)
+                self.assertFalse(captured_actions["中止解压"].isEnabled())
+                self.assertFalse(captured_actions["重新解压"].isEnabled())
+
+                # 5. 点击“中止解压”：验证调用 self._task_queue.abort_task
+                with patch.object(win._task_queue, "abort_task") as mock_abort:
+                    chosen_action_text[0] = "中止解压"
+                    win._on_table_context_menu(pos0)
+                    mock_abort.assert_called_once_with("t_running")
+
+                # 6. 点击“重新解压”：针对“已中止”行重新触发入队
+                with patch.object(win._task_queue, "submit_existing") as mock_submit:
+                    chosen_action_text[0] = "重新解压"
+                    win._on_table_context_menu(pos2)
+                    mock_submit.assert_called_once()
+                    self.assertEqual(win._get_cell_text(2, 1), "排队中")
+                    self.assertEqual(win._get_cell_text(2, 3), "准备重新解压...")
+
+            # 重新解压后统计更新
+            win._update_statistics()
+            self.assertEqual(win._lbl_stats.text(), "共 4 个任务")
+            self.assertEqual(labels["success"].text(), "成功 1")
+            self.assertEqual(labels["failed"].text(), "失败 0")
+            self.assertEqual(labels["running"].text(), "处理中 3")
         finally:
             win.close()
 

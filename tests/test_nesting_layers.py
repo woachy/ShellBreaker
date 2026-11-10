@@ -9,6 +9,8 @@
 - Case 4: 嵌套内含文件夹 (inner.zip 内含 folder/file.txt，验证 folder 及其内容被完整保留且移至外包下)
 - Case 5: 重名防覆盖机制 (相同文件名在嵌套解压上移时自动追加 _1, _2 等后缀且保留扩展名)
 - Case 6: 沙箱残留 _tmp_ 解套与清理安全网 (unwrap_temp_dirs 验证)
+- Case 7: 原生游戏本体文件夹绝对熔断与深层备份 zip 保护验证 (yhsj 场景防穿透)
+- Case 8: 状态流转验证 (无密码压缩包全程绝不发出“验证密码”状态)
 """
 import os
 import sys
@@ -252,6 +254,104 @@ class TestNestingLayers(unittest.TestCase):
         promoted_file = sandbox_out / "payload.txt"
         self.assertTrue(promoted_file.exists(), "payload.txt 未被解套上移")
         self.assertEqual(promoted_file.read_text(encoding="utf-8"), "safe content")
+
+    def test_case_7_native_game_folder_stops_recursion_and_protects_deep_zips(self):
+        """
+        Case 7: 针对 yhsj 场景的绝对熔断测试：
+        外层套娃解压出原生游戏本体文件夹 (Game_Cornelia_Ver1.12) 后，
+        立即绝对熔断，严禁穿透递归进入内部，其深层存储的 676 个翻译工具备份 zip 绝不被解压破坏！
+        """
+        # 1. 构造深层备份 zip
+        save1_path = self.test_dir / "temp_save01.zip"
+        save2_path = self.test_dir / "temp_save02.zip"
+        with zipfile.ZipFile(save1_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("save01.dat", "save data 1 payload")
+        with zipfile.ZipFile(save2_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("save02.dat", "save data 2 payload")
+
+        # 2. 构造套娃内层 inner_game.zip，包含游戏原生文件夹和深层备份 zip
+        inner_zip = self.test_dir / "inner_game.zip"
+        with zipfile.ZipFile(inner_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Game_Cornelia_Ver1.12/Game.exe", "fake_game_exe_binary")
+            zf.writestr("Game_Cornelia_Ver1.12/www/data/Actors.json", '{"actor": "Cornelia"}')
+            zf.write(save1_path, arcname="Game_Cornelia_Ver1.12/MTool/Tool/gameSaveBackup/save01.zip")
+            zf.write(save2_path, arcname="Game_Cornelia_Ver1.12/MTool/Tool/gameSaveBackup/save02.zip")
+
+        # 3. 构造外层套娃包 case7_outer.zip
+        outer_zip = self.test_dir / "case7_outer.zip"
+        with zipfile.ZipFile(outer_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(inner_zip, arcname="inner_game.zip")
+
+        # 清除临时文件
+        save1_path.unlink()
+        save2_path.unlink()
+        inner_zip.unlink()
+
+        # 4. 执行解压任务
+        self.queue._process_task("task_c7", str(outer_zip))
+
+        # 5. 验证交付目录
+        dest_dir = self.test_dir / "case7_outer"
+        self.assertTrue(dest_dir.exists(), f"交付目录不存在: {dest_dir}")
+
+        game_folder = dest_dir / "Game_Cornelia_Ver1.12"
+        self.assertTrue(game_folder.exists(), "游戏原生文件夹缺失")
+        self.assertTrue(game_folder.is_dir(), "游戏原生文件夹不是目录")
+
+        # 验证游戏本体主程序与数据文件完好
+        game_exe = game_folder / "Game.exe"
+        self.assertTrue(game_exe.exists(), "Game.exe 缺失")
+        self.assertEqual(game_exe.read_text(encoding="utf-8"), "fake_game_exe_binary")
+
+        actors_json = game_folder / "www" / "data" / "Actors.json"
+        self.assertTrue(actors_json.exists(), "Actors.json 缺失")
+
+        # 6. 【核心底线验证】深层备份 zip 必须完好无损地以 .zip 格式保留，绝对禁止被当成嵌套包解压！
+        backup_dir = game_folder / "MTool" / "Tool" / "gameSaveBackup"
+        self.assertTrue(backup_dir.exists(), "备份目录缺失")
+
+        deep_zip1 = backup_dir / "save01.zip"
+        deep_zip2 = backup_dir / "save02.zip"
+        self.assertTrue(deep_zip1.exists(), "深层备份 save01.zip 被错误删除或解压")
+        self.assertTrue(deep_zip1.is_file(), "深层备份 save01.zip 不是普通文件")
+        self.assertTrue(deep_zip2.exists(), "深层备份 save02.zip 被错误删除或解压")
+        self.assertTrue(deep_zip2.is_file(), "深层备份 save02.zip 不是普通文件")
+
+        # 验证 zip 内部的文件绝未被泄漏/解包到备份目录下
+        self.assertFalse((backup_dir / "save01.dat").exists(), "save01.dat 被错误解压到了备份目录中")
+        self.assertFalse((backup_dir / "save02.dat").exists(), "save02.dat 被错误解压到了备份目录中")
+
+        # 验证中间套娃 inner_game.zip 已被安全删除，无 _tmp_* 残留
+        all_items = [p.name for p in dest_dir.iterdir()]
+        self.assertNotIn("inner_game.zip", all_items)
+        self.assertFalse(any(name.startswith("_tmp_") for name in all_items))
+
+    def test_case_8_status_flow_unencrypted_archive_never_shows_verifying_password(self):
+        """
+        Case 8: 状态流转验证：
+        无密码的压缩包在全量解压写盘与后续流程中，通知状态为“正在提取”，
+        绝不长期悬停或错误显示为“验证密码”。
+        """
+        archive_path = self.test_dir / "case8_status.zip"
+        with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("test.txt", "unencrypted content")
+
+        recorded_statuses = []
+
+        def on_status_changed(tid, fn, status, eng, rem):
+            if tid == "task_c8":
+                recorded_statuses.append(status)
+
+        self.queue.task_status_changed.connect(on_status_changed)
+
+        self.queue._process_task("task_c8", str(archive_path))
+
+        # 验证状态流转：应该包含“正在提取”，并在最后达到“成功”
+        self.assertIn("正在提取", recorded_statuses)
+        self.assertEqual(recorded_statuses[-1], "成功")
+
+        # 关键验证：无密码解压过程绝对不能发出“验证密码”状态
+        self.assertNotIn("验证密码", recorded_statuses, f"无密码解压出现不合法的状态: {recorded_statuses}")
 
 
 if __name__ == "__main__":

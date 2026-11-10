@@ -23,7 +23,7 @@ def status_palette(tokens: Tokens, status: str) -> tuple[str, str]:
     text = (status or "").strip()
     if text.startswith("成功"):
         return tokens.success, tokens.success_bg
-    if text.startswith("失败"):
+    if text.startswith("失败") or "中止" in text:
         return tokens.danger, tokens.danger_bg
     if text.startswith("已跳过") or "跳过" in text:
         return tokens.warning, tokens.warning_bg
