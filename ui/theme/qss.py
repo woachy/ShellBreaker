@@ -621,7 +621,29 @@ QMenu::separator {
 
 /* ============ 对话框 ============ */
 QDialog {
+    background: @window;
+    color: @text;
+}
+
+QDialog[framelessDialog="true"] {
     background: transparent;
+}
+
+QMessageBox,
+QInputDialog {
+    background: @card;
+    color: @text;
+}
+
+QMessageBox QLabel,
+QInputDialog QLabel {
+    background: transparent;
+    color: @text;
+}
+
+QMessageBox QPushButton,
+QInputDialog QPushButton {
+    min-width: 76px;
 }
 
 QFrame#DialogCard {

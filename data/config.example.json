@@ -1,11 +1,28 @@
 {
-  "engine": "winrar",
+  "default_engine": "bandizip",
   "output_mode": "source_directory",
   "custom_output_path": "",
-  "max_workers": 4,
-  "max_scan_depth": 5,
+  "max_workers": 2,
+  "max_scan_depth": 4,
   "min_file_size_mb": 50,
-  "default_engine": "winrar",
   "bandizip_path": "",
-  "winrar_path": ""
+  "winrar_path": "",
+  "delete_source_after_extract": false,
+  "enable_nested_limit_confirm": true,
+  "nested_confirm_limit": 10,
+  "max_green_cells": 5,
+  "sevenzip_path": "",
+  "delete_source_mode": "keep",
+  "enable_ad_filter": true,
+  "ad_filter_patterns": [
+    "*.url",
+    "*扫码关注*",
+    "*资源发布页*",
+    "*最新地址*",
+    "*免责声明*.txt",
+    "*解压必看*.url"
+  ],
+  "enable_watch_folder": false,
+  "watch_folder_path": "",
+  "theme": "light"
 }

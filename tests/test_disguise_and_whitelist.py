@@ -55,11 +55,11 @@ class TestDisguiseAndWhitelist(unittest.TestCase):
         self.cfg = ConfigManager()
         self._orig_output_mode = self.cfg.get("output_mode")
         self._orig_custom_path = self.cfg.get("custom_output_path")
-        self._orig_disguise_mb = self.cfg.get("disguise_min_size_mb")
+        self._orig_min_file_size_mb = self.cfg.get("min_file_size_mb")
 
         self.cfg.set("output_mode", "source_directory")
         self.cfg.set("custom_output_path", str(self.test_dir))
-        self.cfg.set("disguise_min_size_mb", 10)
+        self.cfg.set("min_file_size_mb", 10)
 
         self.queue = TaskQueue()
         self.queue._ensure_engine()
@@ -69,8 +69,8 @@ class TestDisguiseAndWhitelist(unittest.TestCase):
     def tearDown(self):
         self.cfg.set("output_mode", self._orig_output_mode)
         self.cfg.set("custom_output_path", self._orig_custom_path)
-        if self._orig_disguise_mb is not None:
-            self.cfg.set("disguise_min_size_mb", self._orig_disguise_mb)
+        if self._orig_min_file_size_mb is not None:
+            self.cfg.set("min_file_size_mb", self._orig_min_file_size_mb)
         if self.test_dir.exists():
             shutil.rmtree(self.test_dir, ignore_errors=True)
 

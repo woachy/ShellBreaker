@@ -7,13 +7,16 @@
 from __future__ import annotations
 
 import ctypes
+import html
 import logging
 import os
 import subprocess
 import sys
 import urllib.parse
 import uuid
+from collections import deque
 from ctypes import wintypes
+from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import (
@@ -34,6 +37,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -45,6 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.sandbox import PROTECTED_ENDPOINT_EXTS, SandboxManager, is_secondary_volume
+from core.system_integration import WatchFolderService
 from core.task_queue import TaskQueue
 from data.config_manager import ConfigManager
 from ui.pages.passwords_page import PasswordsPage
@@ -52,17 +57,21 @@ from ui.pages.settings_page import SettingsPage
 from ui.pages.tasks_page import TasksPage
 from ui.theme.icons import (
     ICON_CLEAN,
+    ICON_DELETE,
     ICON_FILE,
     ICON_FOLDER,
     ICON_REFRESH,
     app_icon,
     glyph_icon,
 )
-from ui.theme.theme_manager import ensure_theme, get_current_theme
+from ui.theme.theme_manager import ensure_theme, get_current_theme, get_theme_notifier, repolish
 from ui.theme.tokens import TITLE_BAR_HEIGHT
-from ui.widgets.content_dialog import PasswordInputDialog
+from ui.widgets.content_dialog import ContentDialog, PasswordInputDialog
 from ui.widgets.drop_card import DropCard
+from ui.widgets.extraction_progress_bar import ExtractionProgressWidget
 from ui.widgets.navigation import NavigationView
+from ui.widgets.path_picker import PathPicker
+from ui.widgets.smooth_label import SmoothLabel
 from ui.widgets.title_bar import TitleBar
 
 logger = logging.getLogger("ShellBreaker.MainWindow")
@@ -73,18 +82,35 @@ STATUS_COLORS = {
     "失败": "#C42B1C",
     "正在提取": "#0E7490",
     "验证密码": "#9D5D00",
+    "待确认继续": "#9D5D00",
     "排队中": "#5D5D5D",
     "已跳过": "#9D5D00",
     "已中止": "#C42B1C",
 }
 _DEFAULT_STATUS_COLOR = "#16212B"
 
+
+def _is_terminal_status(status: str) -> bool:
+    """判断任务状态文本是否已进入终态。"""
+    s = (status or "").strip()
+    return (
+        s.startswith("成功")
+        or s.startswith("失败")
+        or "失败" in s
+        or "缺失分卷" in s
+        or s.startswith("已中止")
+        or "中止" in s
+        or s.startswith("已跳过")
+        or "跳过" in s
+    )
+
 # 无边框窗口的命中测试（Windows WM_NCHITTEST）
 _WM_NCHITTEST = 0x0084
 _HTCLIENT = 1
 _RESIZE_BORDER = 6
 
-# DWM：窗口圆角偏好 / 边框颜色
+# DWM：深色标题栏 / 窗口圆角偏好 / 边框颜色
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 _DWMWA_WINDOW_CORNER_PREFERENCE = 33
 _DWMWA_BORDER_COLOR = 34
 _DWMWA_COLOR_NONE = 0xFFFFFFFE
@@ -132,6 +158,89 @@ class DropZone(DropCard):
     clean_path_from_url = staticmethod(clean_path_from_url)
 
 
+class NestedLimitConfirmDialog(ContentDialog):
+    """V2 Fluent 三态嵌套解压确认弹窗：继续解压 / 停止并保留当前产物 / 彻底取消任务。"""
+
+    def __init__(self, filename: str, total_extract_count: int, parent: QWidget | None = None):
+        safe_name = html.escape(str(filename or "未知文件"))
+        count = int(total_extract_count)
+        message = (
+            f"文件 <b>{safe_name}</b> 已累计完成 <b>{count}</b> 次有效解压，"
+            f"且下一层仍存在待解压压缩包。<br>"
+            f"选择「继续解压」将重置本轮计数并继续向下拆解；"
+            f"选择「停止并保留当前产物」将交付目前已解出的内容。"
+        )
+        super().__init__(
+            title="检测到连续多层嵌套解压",
+            message="",
+            width=520,
+            parent=parent,
+            confirm_text="继续解压",
+            cancel_text="停止并保留当前产物",
+        )
+        # Esc 或关闭窗口安全默认保留当前已解产物，避免误丢数据
+        self._choice: str = "stop_keep"
+
+        self.message_label.setTextFormat(Qt.TextFormat.RichText)
+        self.message_label.setText(message)
+        self.message_label.setVisible(True)
+
+        # 醒目摘要提示条
+        info_bar = QFrame(self.card)
+        info_bar.setObjectName("InfoBar")
+        info_bar.setProperty("severity", "warning")
+        info_lay = QHBoxLayout(info_bar)
+        info_lay.setContentsMargins(12, 8, 12, 8)
+        info_lay.setSpacing(8)
+        summary_lbl = QLabel(
+            f"当前任务：{filename or '未知文件'}（已完成 {count} 次解压）",
+            info_bar,
+        )
+        summary_lbl.setWordWrap(True)
+        info_lay.addWidget(summary_lbl, 1)
+        self.body_layout.addWidget(info_bar)
+
+        # 三态按钮：左侧危险动作「彻底取消任务」，右侧「停止并保留当前产物」与主按钮「继续解压」
+        self.btn_continue = self.btn_confirm
+        self.btn_stop_keep = self.btn_cancel
+
+        self.btn_cancel_task = QPushButton("彻底取消任务", self.card)
+        self.btn_cancel_task.setObjectName("DangerSubtle")
+        self.btn_cancel_task.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        card_layout = self.card.layout()
+        if card_layout is not None and card_layout.count() > 0:
+            btn_row_item = card_layout.itemAt(card_layout.count() - 1)
+            btn_row = btn_row_item.layout() if btn_row_item is not None else None
+            if btn_row is not None:
+                btn_row.insertWidget(0, self.btn_cancel_task)
+
+        self.btn_continue.clicked.disconnect()
+        self.btn_stop_keep.clicked.disconnect()
+        self.btn_continue.clicked.connect(self._on_continue)
+        self.btn_stop_keep.clicked.connect(self._on_stop_keep)
+        self.btn_cancel_task.clicked.connect(self._on_cancel_task)
+
+    @property
+    def choice(self) -> str:
+        return self._choice
+
+    def get_choice(self) -> str:
+        return self._choice
+
+    def _on_continue(self):
+        self._choice = "continue"
+        self.accept()
+
+    def _on_stop_keep(self):
+        self._choice = "stop_keep"
+        self.reject()
+
+    def _on_cancel_task(self):
+        self._choice = "cancel"
+        self.reject()
+
+
 class Shell(QFrame):
     """窗口外壳：绘制 V2 三段纵向渐变。"""
 
@@ -171,6 +280,12 @@ class MainWindow(QMainWindow):
         self._task_queue.task_progress.connect(self._on_task_progress)
         self._task_queue.password_needed.connect(self._on_password_needed)
         self._task_queue.password_wrong.connect(self._on_password_wrong)
+        if hasattr(self._task_queue, "task_registered"):
+            self._task_queue.task_registered.connect(self._on_task_registered)
+        if hasattr(self._task_queue, "task_layer_progress"):
+            self._task_queue.task_layer_progress.connect(self._on_task_layer_progress)
+        if hasattr(self._task_queue, "nested_limit_reached"):
+            self._task_queue.nested_limit_reached.connect(self._on_nested_limit_reached)
 
         # ---- 外壳布局： [导航 | (标题栏 + 页面)] ----
         central = QWidget(self)
@@ -262,10 +377,26 @@ class MainWindow(QMainWindow):
         # 映射与元数据记录
         self._task_rows: dict[str, int] = {}
         self._task_data: dict[str, dict] = {}
+        self._progress_widgets: dict[str, ExtractionProgressWidget] = {}
+        self._pending_nested_confirms: deque[tuple[str, str, int]] = deque()
+        self._nested_dialog_open: bool = False
 
-        # 启动调度器
+        # 监听文件夹服务
+        self.watch_service = WatchFolderService(self)
+        self.watch_service.file_ready.connect(self._on_watch_file_ready)
+
+        # 动态主题切换响应
+        get_theme_notifier().theme_changed.connect(self._on_theme_changed)
+
+        # 启动调度器与监听服务
         self._task_queue.start()
+        self._sync_watch_folder()
         self._update_statistics()
+
+    @property
+    def task_queue(self) -> TaskQueue:
+        """向后/契约兼容：公开任务队列引用。"""
+        return self._task_queue
 
     # ---------- 窗口绘制与自适应 ----------
 
@@ -281,6 +412,23 @@ class MainWindow(QMainWindow):
             self.title_bar.sync_state()
 
     def closeEvent(self, event):
+        try:
+            get_theme_notifier().theme_changed.disconnect(self._on_theme_changed)
+        except (RuntimeError, TypeError):
+            pass
+        if hasattr(self, "settings_page"):
+            self.settings_page.close()
+        if hasattr(self, "watch_service"):
+            self.watch_service.stop()
+            try:
+                self.watch_service.file_ready.disconnect(self._on_watch_file_ready)
+            except (RuntimeError, TypeError):
+                pass
+        self._pending_nested_confirms.clear()
+        for widget in self._progress_widgets.values():
+            widget.stop_animation()
+        if hasattr(self._task_queue, "abort_all"):
+            self._task_queue.abort_all()
         self._task_queue.shutdown(wait=False)
         super().closeEvent(event)
 
@@ -289,6 +437,92 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_native_frame_ready", False):
             self._native_frame_ready = True
             self._apply_native_frame()
+
+    def _apply_dwm_dark_mode(self, is_dark: bool) -> None:
+        """同步 Windows DWM 标题栏深色/浅色沉浸模式属性。"""
+        if sys.platform != "win32":
+            return
+        try:
+            hwnd = wintypes.HWND(int(self.winId()))
+            dwmapi = ctypes.windll.dwmapi
+            value = ctypes.c_int(1 if is_dark else 0)
+            hr = dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                _DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(value),
+                ctypes.sizeof(value),
+            )
+            if hr != 0:
+                # 兼容旧版 Windows 10 (1903/1909)
+                dwmapi.DwmSetWindowAttribute(
+                    hwnd, 19, ctypes.byref(value), ctypes.sizeof(value)
+                )
+        except Exception:  # pragma: no cover - 非 Windows 或无 DWM 静默降级
+            pass
+
+    def _on_theme_changed(self, mode: str) -> None:
+        """运行时动态切换主题后刷新 DWM 属性、自绘容器、图标与子页面。"""
+        is_dark = str(mode or "").strip().lower() in ("dark", "v2-dark")
+        theme = get_current_theme()
+
+        if getattr(self, "_native_frame_ready", False) or self.isVisible():
+            self._apply_dwm_dark_mode(is_dark)
+
+        # 1. 刷新所有 SmoothLabel 的文字颜色
+        for lbl in self.findChildren(SmoothLabel):
+            lbl.set_text_color(theme.text)
+
+        # 2. 刷新导航栏图标与选中样式
+        if hasattr(self, "nav"):
+            for btn in getattr(self.nav, "_buttons", ()):
+                if hasattr(btn, "_apply_icon"):
+                    btn._apply_icon()
+                repolish(btn)
+            repolish(self.nav)
+            self.nav.update()
+
+        # 3. 刷新标题栏与自绘系统按钮
+        if hasattr(self, "title_bar"):
+            repolish(self.title_bar)
+            for btn in (self.title_bar.btn_min, self.title_bar.btn_max, self.title_bar.btn_close):
+                btn.update()
+            self.title_bar.update()
+
+        # 4. 刷新任务页（拖放卡、按钮图标、空状态、状态条色点、表格与进度组件）
+        if hasattr(self, "tasks_page"):
+            self.tasks_page.drop_card._refresh_icon()
+            repolish(self.tasks_page.drop_card)
+            self.tasks_page.btn_clean_finished.setIcon(glyph_icon(ICON_DELETE, theme.text2, 16))
+            self.tasks_page._refresh_empty_icon()
+            self.tasks_page.status_bar._apply_colors()
+            repolish(self.tasks_page.status_bar)
+            self.tasks_page.status_bar.update()
+            self._table.viewport().update()
+            self._table.horizontalHeader().viewport().update()
+            for pw in self._progress_widgets.values():
+                pw.update()
+            repolish(self.tasks_page)
+
+        # 5. 刷新密码页图标与表格
+        if hasattr(self, "passwords_page"):
+            self.passwords_page._refresh_icons()
+            self.passwords_page._table.viewport().update()
+            self.passwords_page._table.horizontalHeader().viewport().update()
+            repolish(self.passwords_page)
+
+        # 6. 刷新设置页图标与路径选择器
+        if hasattr(self, "settings_page"):
+            self.settings_page._refresh_icons()
+            for picker in self.settings_page.findChildren(PathPicker):
+                picker._refresh_icon()
+            repolish(self.settings_page)
+
+        # 7. 刷新外壳渐变与全窗重绘，杜绝残影
+        repolish(self.shell)
+        self.shell.update()
+        for child in self.findChildren(QWidget):
+            child.update()
+        self.update()
 
     def _apply_native_frame(self):
         """让 DWM 负责圆角与窗口投影。
@@ -330,6 +564,7 @@ class MainWindow(QMainWindow):
             dwmapi.DwmSetWindowAttribute(
                 hwnd, _DWMWA_BORDER_COLOR, ctypes.byref(border), ctypes.sizeof(border)
             )
+            self._apply_dwm_dark_mode("dark" in (get_current_theme().name or "").lower())
         except Exception:  # pragma: no cover - 老系统或非 DWM 环境静默降级
             pass
 
@@ -491,6 +726,10 @@ class MainWindow(QMainWindow):
 
     def _on_drop_path_ready(self, clean_path: str):
         """拖拽入口安检：严格分流文件与文件夹（铁律一）。"""
+        self._enqueue_single_path(clean_path, silent=False)
+
+    def _enqueue_single_path(self, clean_path: str, silent: bool = False) -> bool:
+        """统一路径入队安检（供拖拽、监听文件夹、命令行与单实例 IPC 复用）。"""
         if os.path.isfile(clean_path):
             task_id = str(uuid.uuid4())[:8]
             filename = os.path.basename(clean_path)
@@ -506,44 +745,131 @@ class MainWindow(QMainWindow):
             # 受保护终点程序检查 (.apk, .exe, .msi)
             ext = os.path.splitext(clean_path)[1].lower()
             if ext in PROTECTED_ENDPOINT_EXTS:
-                self._add_task_row(task_id, filename)
-                self._set_cell(self._task_rows[task_id], 1, "已跳过")
-                self._set_cell(self._task_rows[task_id], 3, f"受保护终点程序 ({ext})")
+                self._add_task_row(task_id, filename, force_scroll=True)
+                row = self._task_rows[task_id]
+                self._set_cell(row, TasksPage.COL_STATUS, "已跳过")
+                self._set_cell(row, TasksPage.COL_REMARK, f"受保护终点程序 ({ext})")
+                self._ensure_progress_widget(task_id, row).set_terminal_state("已跳过")
                 self._task_data[task_id]["status"] = "已跳过"
                 self._task_data[task_id]["remark"] = f"受保护终点程序 ({ext})"
                 self._update_statistics()
                 logger.info(f"终点白名单保护，跳过: {filename}")
-                return
+                return True
 
             # 非首卷分卷检查 (.part02+ 或 .002+)
             if is_secondary_volume(filename):
-                self._add_task_row(task_id, filename)
-                self._set_cell(self._task_rows[task_id], 1, "已跳过")
-                self._set_cell(self._task_rows[task_id], 3, "非首卷分卷（由首卷统一解压）")
+                self._add_task_row(task_id, filename, force_scroll=True)
+                row = self._task_rows[task_id]
+                self._set_cell(row, TasksPage.COL_STATUS, "已跳过")
+                self._set_cell(row, TasksPage.COL_REMARK, "非首卷分卷（由首卷统一解压）")
+                self._ensure_progress_widget(task_id, row).set_terminal_state("已跳过")
                 self._task_data[task_id]["status"] = "已跳过"
                 self._task_data[task_id]["remark"] = "非首卷分卷（由首卷统一解压）"
                 self._update_statistics()
                 logger.info(f"非首卷分卷，跳过单独解压: {filename}")
-                return
+                return True
 
             # 大小预检查
             if self._task_queue._is_file_too_small(clean_path):
-                self._add_task_row(task_id, filename)
-                self._set_cell(self._task_rows[task_id], 1, "已跳过(文件过小)")
-                self._set_cell(self._task_rows[task_id], 3, "文件过小跳过")
+                self._add_task_row(task_id, filename, force_scroll=True)
+                row = self._task_rows[task_id]
+                self._set_cell(row, TasksPage.COL_STATUS, "已跳过(文件过小)")
+                self._set_cell(row, TasksPage.COL_REMARK, "文件过小跳过")
+                self._ensure_progress_widget(task_id, row).set_terminal_state("已跳过(文件过小)")
                 self._task_data[task_id]["status"] = "已跳过(文件过小)"
                 self._update_statistics()
                 logger.info(f"文件过小，跳过: {filename} ({os.path.getsize(clean_path)} bytes)")
-                return
+                return True
 
-            self._add_task_row(task_id, filename)
-            self._set_cell(self._task_rows[task_id], 1, "排队中")
+            self._add_task_row(task_id, filename, force_scroll=True)
+            self._set_cell(self._task_rows[task_id], TasksPage.COL_STATUS, "排队中")
             self._task_queue.submit_existing(task_id, clean_path)
             self._update_statistics()
+            return True
         elif os.path.isdir(clean_path):
             self._handle_directory_drop(clean_path)
+            return True
         else:
-            QMessageBox.warning(self, "路径错误", f"路径不存在:\n{clean_path}")
+            if not silent:
+                QMessageBox.warning(self, "路径错误", f"路径不存在:\n{clean_path}")
+            return False
+
+    # ---------- 监听文件夹 & 命令行 / 单实例入队 ----------
+
+    def _sync_watch_folder(self) -> None:
+        """根据当前配置实时启动、切换或停止 WatchFolderService。"""
+        enabled = bool(self._config.get("enable_watch_folder", False))
+        folder_path = str(self._config.get("watch_folder_path", "") or "").strip()
+
+        if not enabled or not folder_path or not os.path.isdir(folder_path):
+            if self.watch_service.is_running():
+                logger.info("监听文件夹已关闭或目录无效，停止监听服务")
+                self.watch_service.stop()
+            return
+
+        try:
+            target_dir = Path(folder_path).resolve()
+        except OSError:
+            if self.watch_service.is_running():
+                self.watch_service.stop()
+            return
+
+        if self.watch_service.is_running() and self.watch_service.watch_dir() == target_dir:
+            return
+
+        if not self.watch_service.start(target_dir):
+            logger.warning(f"启动监听文件夹服务失败: {target_dir}")
+
+    def _on_watch_file_ready(self, file_path: str) -> None:
+        """响应 WatchFolderService 检测到稳定新压缩包，静默加入解压队列。"""
+        if not file_path or not os.path.isfile(file_path):
+            return
+        clean_path = os.path.abspath(file_path)
+        logger.info(f"监听文件夹静默入队: {clean_path}")
+        self._enqueue_single_path(clean_path, silent=True)
+
+    def enqueue_cli_paths(self, paths: list[str]) -> int:
+        """接收命令行或单实例 IPC 转发的路径：激活窗口、切至任务页并全部入队。"""
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+        valid_paths: list[str] = []
+        seen: set[str] = set()
+        for raw in paths or []:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            cleaned = clean_path_from_url(text)
+            if not os.path.exists(cleaned):
+                logger.warning(f"CLI/IPC 路径不存在，已忽略: {raw}")
+                continue
+            norm_key = os.path.normcase(cleaned)
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
+            valid_paths.append(cleaned)
+
+        if not valid_paths:
+            return 0
+
+        self.nav.set_current_index(0)
+        self.stack.setCurrentIndex(0)
+
+        accepted = 0
+        for path in valid_paths:
+            if self._enqueue_single_path(path, silent=True):
+                accepted += 1
+
+        if accepted == 1:
+            self.tasks_page.drop_card.set_received_hint(f"已接收: {valid_paths[0]}")
+        elif accepted > 1:
+            self.tasks_page.drop_card.set_received_hint(f"已接收 {accepted} 个文件/文件夹")
+
+        logger.info(f"CLI/IPC 入队完成，共接收 {accepted} 个有效路径")
+        return accepted
 
     def _handle_directory_drop(self, dir_path: str):
         """将文件夹转交递归扫描器。"""
@@ -555,25 +881,68 @@ class MainWindow(QMainWindow):
 
     # ---------- 任务表核心逻辑 ----------
 
-    def _add_task_row(self, task_id: str, filename: str):
+    def _ensure_progress_widget(self, task_id: str, row: int) -> ExtractionProgressWidget:
+        """定位或创建指定任务行的解压进度与绿格组件。"""
+        existing = self._table.cellWidget(row, TasksPage.COL_PROGRESS)
+        if isinstance(existing, ExtractionProgressWidget):
+            self._progress_widgets[task_id] = existing
+            return existing
+
+        max_cells = int(self._config.get("max_green_cells", 5) or 5)
+        widget = ExtractionProgressWidget(max_green_cells=max_cells, parent=self._table)
+        self._table.setCellWidget(row, TasksPage.COL_PROGRESS, widget)
+        self._progress_widgets[task_id] = widget
+        return widget
+
+    def _add_task_row(self, task_id: str, filename: str, force_scroll: bool = False):
+        vbar = self._table.verticalScrollBar()
+        was_near_bottom = True if vbar is None else (vbar.maximum() - vbar.value()) <= 24
+
         row = self._table.rowCount()
         self._table.insertRow(row)
-        for col in range(4):
-            item = QTableWidgetItem(filename if col == 0 else "")
+        for col in range(self._table.columnCount()):
+            item = QTableWidgetItem(filename if col == TasksPage.COL_FILENAME else "")
             item.setData(Qt.ItemDataRole.UserRole, task_id)
             self._table.setItem(row, col, item)
+        self._ensure_progress_widget(task_id, row)
         self._task_rows[task_id] = row
         self._update_statistics()
+        if force_scroll or was_near_bottom:
+            self._table.scrollToBottom()
+
+    def _on_task_registered(self, task_id: str, src_path: str):
+        """接收任务队列注册的源文件路径（修复文件夹扫描任务缺少 src_path）。"""
+        if not task_id:
+            return
+        info = self._task_data.get(task_id)
+        if info is None:
+            self._task_data[task_id] = {
+                "src_path": src_path,
+                "filename": os.path.basename(src_path) if src_path else "",
+                "status": "排队中",
+                "engine": "",
+                "dest_path": "",
+                "remark": "",
+            }
+        elif src_path:
+            info["src_path"] = src_path
+            if not info.get("filename"):
+                info["filename"] = os.path.basename(src_path)
 
     def _on_task_status_changed(self, task_id: str, filename: str, status: str, engine: str, remark: str):
         """信号驱动：原地更新表格行，绝不插入重复行。状态文本原样保留不归一化。"""
         row = self._task_rows.get(task_id)
         if row is None:
-            self._add_task_row(task_id, filename)
+            self._add_task_row(task_id, filename, force_scroll=False)
             row = self._task_rows[task_id]
             if task_id not in self._task_data:
+                src_path = (
+                    self._task_queue.get_task_src_path(task_id)
+                    if hasattr(self._task_queue, "get_task_src_path")
+                    else ""
+                )
                 self._task_data[task_id] = {
-                    "src_path": "",
+                    "src_path": src_path or "",
                     "filename": filename,
                     "status": status,
                     "engine": engine,
@@ -583,6 +952,10 @@ class MainWindow(QMainWindow):
 
         # 更新元数据记录
         if task_id in self._task_data:
+            if not self._task_data[task_id].get("src_path") and hasattr(self._task_queue, "get_task_src_path"):
+                fallback_src = self._task_queue.get_task_src_path(task_id)
+                if fallback_src:
+                    self._task_data[task_id]["src_path"] = fallback_src
             self._task_data[task_id]["status"] = status
             if engine:
                 self._task_data[task_id]["engine"] = engine
@@ -592,14 +965,43 @@ class MainWindow(QMainWindow):
                     self._task_data[task_id]["dest_path"] = remark
 
         if filename:
-            item = self._table.item(row, 0)
+            item = self._table.item(row, TasksPage.COL_FILENAME)
             if item:
                 item.setText(filename)
-        self._set_cell(row, 1, status)
-        self._set_cell(row, 2, engine)
-        self._set_cell(row, 3, remark)
+        self._set_cell(row, TasksPage.COL_STATUS, status)
+        self._set_cell(row, TasksPage.COL_ENGINE, engine)
+        self._set_cell(row, TasksPage.COL_REMARK, remark)
+
+        if _is_terminal_status(status):
+            self._ensure_progress_widget(task_id, row).set_terminal_state(status)
+        elif status == "待确认继续":
+            widget = self._ensure_progress_widget(task_id, row)
+            widget.stop_animation()
+            if remark:
+                widget.setToolTip(remark)
+
         self._update_statistics()
-        self._table.scrollToBottom()
+
+    def _on_task_layer_progress(
+        self,
+        task_id: str,
+        current_percent: int,
+        completed_count: int,
+        status_text: str,
+    ):
+        """实时更新当前层解压进度条与已完成层绿格；严禁覆盖终态备注或终态进度。"""
+        row = self._task_rows.get(task_id)
+        if row is None:
+            return
+        current_status = self._get_cell_text(row, TasksPage.COL_STATUS)
+        data_status = self._task_data.get(task_id, {}).get("status", "")
+        if _is_terminal_status(current_status) or _is_terminal_status(data_status):
+            return
+
+        widget = self._ensure_progress_widget(task_id, row)
+        widget.update_state(current_percent, completed_count, status_text)
+        if status_text and status_text.strip() != "任务结束":
+            self._set_cell(row, TasksPage.COL_REMARK, status_text)
 
     def _set_cell(self, row: int, col: int, text: str):
         item = self._table.item(row, col)
@@ -609,23 +1011,30 @@ class MainWindow(QMainWindow):
         else:
             item.setText(text)
 
-        if col == 1:
+        if col == TasksPage.COL_STATUS:
             # 状态列由 StatusPillDelegate 负责着色；这里只保留加粗语义
             font = item.font()
             font.setBold(True)
             item.setFont(font)
 
     def _on_task_progress(self, task_id: str, status_text: str):
-        """保持兼容：将进度写入备注列。"""
+        """保持兼容：仅在非终态且非“任务结束”时将进度写入备注列。"""
+        if not status_text or status_text.strip() == "任务结束":
+            return
         row = self._task_rows.get(task_id)
-        if row is not None:
-            self._set_cell(row, 3, status_text)
+        if row is None:
+            return
+        current_status = self._get_cell_text(row, TasksPage.COL_STATUS)
+        data_status = self._task_data.get(task_id, {}).get("status", "")
+        if _is_terminal_status(current_status) or _is_terminal_status(data_status):
+            return
+        self._set_cell(row, TasksPage.COL_REMARK, status_text)
 
     def _sync_task_rows(self):
         """重新同步 self._task_rows 映射。"""
         self._task_rows.clear()
         for r in range(self._table.rowCount()):
-            item = self._table.item(r, 0)
+            item = self._table.item(r, TasksPage.COL_FILENAME)
             if item:
                 tid = item.data(Qt.ItemDataRole.UserRole)
                 if tid:
@@ -644,13 +1053,13 @@ class MainWindow(QMainWindow):
     def _locate_task_target(self, row: int):
         if row < 0 or row >= self._table.rowCount():
             return
-        item_0 = self._table.item(row, 0)
+        item_0 = self._table.item(row, TasksPage.COL_FILENAME)
         if not item_0:
             return
         task_id = item_0.data(Qt.ItemDataRole.UserRole)
         info = self._task_data.get(task_id, {})
-        status = self._get_cell_text(row, 1)
-        remark = self._get_cell_text(row, 3)
+        status = self._get_cell_text(row, TasksPage.COL_STATUS)
+        remark = self._get_cell_text(row, TasksPage.COL_REMARK)
 
         if not status.startswith("成功"):
             return
@@ -680,16 +1089,20 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= self._table.rowCount():
             return
 
-        item_0 = self._table.item(row, 0)
+        item_0 = self._table.item(row, TasksPage.COL_FILENAME)
         if not item_0:
             return
         theme = get_current_theme()
         task_id = item_0.data(Qt.ItemDataRole.UserRole)
         info = self._task_data.get(task_id, {})
-        status = self._get_cell_text(row, 1)
-        remark = self._get_cell_text(row, 3)
+        status = self._get_cell_text(row, TasksPage.COL_STATUS)
+        remark = self._get_cell_text(row, TasksPage.COL_REMARK)
         target_path = info.get("dest_path") or (remark if status.startswith("成功") else "")
         src_path = info.get("src_path", "")
+        if not src_path and task_id and hasattr(self._task_queue, "get_task_src_path"):
+            src_path = self._task_queue.get_task_src_path(task_id) or ""
+            if src_path and task_id in self._task_data:
+                self._task_data[task_id]["src_path"] = src_path
 
         menu = QMenu(self)
 
@@ -712,12 +1125,20 @@ class MainWindow(QMainWindow):
 
         # 4. 中止解压
         act_abort = menu.addAction(glyph_icon(ICON_CLEAN, theme.danger, 16), "中止解压")
-        is_in_progress = status in ("正在提取", "验证密码", "排队中") or "正在" in status
+        is_in_progress = (not _is_terminal_status(status)) and (
+            status in ("正在提取", "验证密码", "排队中", "待确认继续") or "正在" in status
+        )
         act_abort.setEnabled(is_in_progress)
 
         # 5. 重新解压
         act_retry = menu.addAction(glyph_icon(ICON_REFRESH, theme.text2, 16), "重新解压")
-        can_retry = (status.startswith("失败") or "跳过" in status or "中止" in status) and bool(src_path) and os.path.exists(src_path)
+        can_retry = (
+            status.startswith("失败")
+            or "失败" in status
+            or "缺失分卷" in status
+            or "跳过" in status
+            or "中止" in status
+        ) and bool(src_path) and os.path.exists(src_path)
         act_retry.setEnabled(can_retry)
 
         # 6. 从列表中移除
@@ -773,21 +1194,26 @@ class MainWindow(QMainWindow):
         """重新解压任务。"""
         info = self._task_data.get(task_id, {})
         src_path = info.get("src_path", "")
+        if not src_path and task_id and hasattr(self._task_queue, "get_task_src_path"):
+            src_path = self._task_queue.get_task_src_path(task_id) or ""
         if not src_path or not os.path.exists(src_path):
             QMessageBox.warning(self, "错误", f"源文件不存在，无法重新解压:\n{src_path}")
             return
 
         filename = os.path.basename(src_path)
         if self._task_queue._is_file_too_small(src_path):
-            self._set_cell(row, 1, "已跳过(文件过小)")
-            self._set_cell(row, 3, "文件过小跳过")
-            self._task_data[task_id]["status"] = "已跳过(文件过小)"
+            self._set_cell(row, TasksPage.COL_STATUS, "已跳过(文件过小)")
+            self._set_cell(row, TasksPage.COL_REMARK, "文件过小跳过")
+            self._ensure_progress_widget(task_id, row).set_terminal_state("已跳过(文件过小)")
+            if task_id in self._task_data:
+                self._task_data[task_id]["status"] = "已跳过(文件过小)"
             self._update_statistics()
             return
 
         new_task_id = str(uuid.uuid4())[:8]
         self._task_rows.pop(task_id, None)
         self._task_data.pop(task_id, None)
+        self._progress_widgets.pop(task_id, None)
 
         self._task_rows[new_task_id] = row
         self._task_data[new_task_id] = {
@@ -799,14 +1225,17 @@ class MainWindow(QMainWindow):
             "remark": "准备重新解压...",
         }
 
-        for col in range(4):
+        for col in range(self._table.columnCount()):
             item = self._table.item(row, col)
             if item:
                 item.setData(Qt.ItemDataRole.UserRole, new_task_id)
 
-        self._set_cell(row, 1, "排队中")
-        self._set_cell(row, 2, "")
-        self._set_cell(row, 3, "准备重新解压...")
+        widget = self._ensure_progress_widget(new_task_id, row)
+        widget.update_state(0, 0, "准备重新解压...")
+
+        self._set_cell(row, TasksPage.COL_STATUS, "排队中")
+        self._set_cell(row, TasksPage.COL_ENGINE, "")
+        self._set_cell(row, TasksPage.COL_REMARK, "准备重新解压...")
         self._task_queue.submit_existing(new_task_id, src_path)
         self._update_statistics()
         logger.info(f"任务已重新提交入队 [old={task_id}, new={new_task_id}]: {src_path}")
@@ -815,6 +1244,9 @@ class MainWindow(QMainWindow):
         """从表格中移除单行任务。"""
         self._task_rows.pop(task_id, None)
         self._task_data.pop(task_id, None)
+        widget = self._progress_widgets.pop(task_id, None)
+        if widget is not None:
+            widget.stop_animation()
         self._table.removeRow(row)
         self._sync_task_rows()
         self._update_statistics()
@@ -830,16 +1262,16 @@ class MainWindow(QMainWindow):
         in_progress = 0
         skipped = 0
         for r in range(total):
-            st = self._get_cell_text(r, 1)
+            st = self._get_cell_text(r, TasksPage.COL_STATUS)
             if not st:
                 continue
             if st.startswith("成功"):
                 success += 1
-            elif st.startswith("失败") or "中止" in st:
+            elif st.startswith("失败") or "失败" in st or "缺失分卷" in st or "中止" in st:
                 failed += 1
             elif "跳过" in st:
                 skipped += 1
-            elif st in ("正在提取", "验证密码", "排队中") or "正在" in st:
+            elif st in ("正在提取", "验证密码", "排队中", "待确认继续") or "正在" in st:
                 in_progress += 1
 
         self._lbl_stats.setText(f"共 {total} 个任务")
@@ -850,20 +1282,60 @@ class MainWindow(QMainWindow):
         """点击 [清空已完成]：清理表格中所有“成功”或“已跳过”的行。"""
         cleaned_count = 0
         for r in range(self._table.rowCount() - 1, -1, -1):
-            item_status = self._table.item(r, 1)
+            item_status = self._table.item(r, TasksPage.COL_STATUS)
             if item_status:
                 st = item_status.text()
                 if st.startswith("成功") or "跳过" in st:
-                    item_0 = self._table.item(r, 0)
+                    item_0 = self._table.item(r, TasksPage.COL_FILENAME)
                     if item_0:
                         tid = item_0.data(Qt.ItemDataRole.UserRole)
                         self._task_rows.pop(tid, None)
                         self._task_data.pop(tid, None)
+                        widget = self._progress_widgets.pop(tid, None)
+                        if widget is not None:
+                            widget.stop_animation()
                     self._table.removeRow(r)
                     cleaned_count += 1
         self._sync_task_rows()
         self._update_statistics()
         logger.info(f"清空已完成任务，共清理 {cleaned_count} 条记录")
+
+    # ---------- 嵌套解压次数上限确认（FIFO 串行防嵌套 exec） ----------
+
+    def _on_nested_limit_reached(self, task_id: str, filename: str, total_extract_count: int):
+        """嵌套解压达到上限阈值：加入 FIFO 队列并串行弹窗确认。"""
+        self._pending_nested_confirms.append((task_id, filename, int(total_extract_count)))
+        if not self._nested_dialog_open:
+            self._drain_nested_confirm_queue()
+
+    def _drain_nested_confirm_queue(self):
+        if self._nested_dialog_open:
+            return
+        self._nested_dialog_open = True
+        try:
+            while self._pending_nested_confirms:
+                task_id, filename, total_count = self._pending_nested_confirms.popleft()
+                if hasattr(self._task_queue, "is_aborted") and self._task_queue.is_aborted(task_id):
+                    logger.info(f"[{task_id}] 排队等待确认期间已被中止，跳过嵌套确认弹窗")
+                    if hasattr(self._task_queue, "supply_nested_confirm"):
+                        self._task_queue.supply_nested_confirm(task_id, "cancel")
+                    continue
+                data_status = self._task_data.get(task_id, {}).get("status", "")
+                if _is_terminal_status(data_status):
+                    logger.info(f"[{task_id}] 已进入终态 ({data_status})，跳过嵌套确认弹窗")
+                    if hasattr(self._task_queue, "supply_nested_confirm"):
+                        self._task_queue.supply_nested_confirm(task_id, "cancel")
+                    continue
+
+                logger.info(f"[{task_id}] 弹出嵌套解压确认弹窗: {filename} (已完成 {total_count} 次)")
+                dlg = NestedLimitConfirmDialog(filename, total_count, parent=self)
+                dlg.exec()
+                choice = dlg.get_choice()
+                logger.info(f"[{task_id}] 用户嵌套确认选择: {choice}")
+                if hasattr(self._task_queue, "supply_nested_confirm"):
+                    self._task_queue.supply_nested_confirm(task_id, choice)
+        finally:
+            self._nested_dialog_open = False
 
     # ---------- 密码自学习与对话框 ----------
 
@@ -915,10 +1387,7 @@ class MainWindow(QMainWindow):
         self._config.save()
         logger.info(f"源文件自动删除快捷开关变更为: {checked}")
         if hasattr(self, "settings_page"):
-            cb = self.settings_page.cb_delete_source
-            cb.blockSignals(True)
-            cb.setChecked(checked)
-            cb.blockSignals(False)
+            self.settings_page.sync_delete_source_from_config()
 
     def _on_settings_clicked(self):
         logger.info("切换到「全局设置」页面")
@@ -928,10 +1397,24 @@ class MainWindow(QMainWindow):
 
     def _on_settings_page_changed(self, key: str):
         """响应设置页的数据修改。"""
-        if key in ("default_engine", "max_workers", "bandizip_path", "winrar_path", "reset_defaults", "flush"):
+        if key in (
+            "default_engine",
+            "max_workers",
+            "bandizip_path",
+            "winrar_path",
+            "sevenzip_path",
+            "reset_defaults",
+            "flush",
+        ):
             self._task_queue.reload_config()
-        if key in ("delete_source_after_extract", "reset_defaults", "flush"):
+        if key in ("delete_source_after_extract", "delete_source_mode", "reset_defaults", "flush"):
             is_del = bool(self._config.get("delete_source_after_extract", False))
             self._cb_delete_source.blockSignals(True)
             self._cb_delete_source.setChecked(is_del)
             self._cb_delete_source.blockSignals(False)
+        if key in ("enable_watch_folder", "watch_folder_path", "reset_defaults", "flush"):
+            self._sync_watch_folder()
+        if key in ("max_green_cells", "reset_defaults", "flush"):
+            max_cells = int(self._config.get("max_green_cells", 5) or 5)
+            for widget in self._progress_widgets.values():
+                widget.set_max_green_cells(max_cells)

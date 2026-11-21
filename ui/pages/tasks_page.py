@@ -28,11 +28,17 @@ from ui.widgets.smooth_label import SmoothLabel
 from ui.widgets.status_bar import StatusBar
 from ui.widgets.status_pill import PrimaryTextDelegate, SecondaryTextDelegate, StatusPillDelegate
 
-HEADERS = ["文件名", "处理状态", "使用引擎", "详细备注"]
+HEADERS = ["文件名", "处理状态", "解压进度", "使用引擎", "详细备注"]
 
 
 class TasksPage(QWidget):
     """任务页容器。"""
+
+    COL_FILENAME = 0
+    COL_STATUS = 1
+    COL_PROGRESS = 2
+    COL_ENGINE = 3
+    COL_REMARK = 4
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -102,7 +108,7 @@ class TasksPage(QWidget):
         card_lay.addWidget(card_header)
 
         # ---- 表格 ----
-        self.table = QTableWidget(0, 4, self.task_card)
+        self.table = QTableWidget(0, len(HEADERS), self.task_card)
         self.table.setObjectName("TaskTable")
         self.table.setHorizontalHeaderLabels(HEADERS)
         self.table.verticalHeader().setVisible(False)
@@ -125,17 +131,20 @@ class TasksPage(QWidget):
         header_view.setFixedHeight(TABLE_HEADER_HEIGHT)
         header_view.setHighlightSections(False)
         header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header_view.resizeSection(1, 168)
-        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header_view.resizeSection(2, 172)
-        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(self.COL_FILENAME, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(self.COL_STATUS, QHeaderView.ResizeMode.Fixed)
+        header_view.resizeSection(self.COL_STATUS, 156)
+        header_view.setSectionResizeMode(self.COL_PROGRESS, QHeaderView.ResizeMode.Fixed)
+        header_view.resizeSection(self.COL_PROGRESS, 214)
+        header_view.setSectionResizeMode(self.COL_ENGINE, QHeaderView.ResizeMode.Fixed)
+        header_view.resizeSection(self.COL_ENGINE, 120)
+        header_view.setSectionResizeMode(self.COL_REMARK, QHeaderView.ResizeMode.Stretch)
 
-        self.table.setItemDelegateForColumn(0, PrimaryTextDelegate(self.table))
-        self.table.setItemDelegateForColumn(1, StatusPillDelegate(self.table))
-        self.table.setItemDelegateForColumn(2, SecondaryTextDelegate(self.table))
-        self.table.setItemDelegateForColumn(3, SecondaryTextDelegate(self.table))
+        self.table.setItemDelegateForColumn(self.COL_FILENAME, PrimaryTextDelegate(self.table))
+        self.table.setItemDelegateForColumn(self.COL_STATUS, StatusPillDelegate(self.table))
+        self.table.setItemDelegateForColumn(self.COL_PROGRESS, SecondaryTextDelegate(self.table))
+        self.table.setItemDelegateForColumn(self.COL_ENGINE, SecondaryTextDelegate(self.table))
+        self.table.setItemDelegateForColumn(self.COL_REMARK, SecondaryTextDelegate(self.table))
 
         card_lay.addWidget(self.table, 1)
         content_lay.addWidget(self.task_card, 1)

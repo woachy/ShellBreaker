@@ -672,6 +672,8 @@ class TestFeatureUIComponents(unittest.TestCase):
 
     def test_main_window_table_receives_skipped_secondary_volume(self):
         """测试主窗口收到非首卷或过小跳过状态时，表格成功创建行而非丢失记录。"""
+        from ui.pages.tasks_page import TasksPage
+
         win = self.MainWindow()
         try:
             initial_rows = win._table.rowCount()
@@ -682,9 +684,10 @@ class TestFeatureUIComponents(unittest.TestCase):
             self.assertEqual(win._table.rowCount(), initial_rows + 1)
             row = win._task_rows.get("task_skip_1")
             self.assertIsNotNone(row)
-            self.assertEqual(win._table.item(row, 0).text(), "game.part02.rar")
-            self.assertEqual(win._table.item(row, 1).text(), "已跳过(非首卷分卷)")
-            self.assertEqual(win._table.item(row, 3).text(), "由首卷统一解压")
+            self.assertEqual(win._table.item(row, TasksPage.COL_FILENAME).text(), "game.part02.rar")
+            self.assertEqual(win._table.item(row, TasksPage.COL_STATUS).text(), "已跳过(非首卷分卷)")
+            self.assertEqual(win._table.item(row, TasksPage.COL_ENGINE).text(), "WinRAR")
+            self.assertEqual(win._table.item(row, TasksPage.COL_REMARK).text(), "由首卷统一解压")
 
             # 模拟文件过小跳过信号
             win._on_task_status_changed(
@@ -693,8 +696,10 @@ class TestFeatureUIComponents(unittest.TestCase):
             self.assertEqual(win._table.rowCount(), initial_rows + 2)
             row2 = win._task_rows.get("task_skip_2")
             self.assertIsNotNone(row2)
-            self.assertEqual(win._table.item(row2, 0).text(), "tiny.zip")
-            self.assertEqual(win._table.item(row2, 1).text(), "已跳过(文件过小)")
+            self.assertEqual(win._table.item(row2, TasksPage.COL_FILENAME).text(), "tiny.zip")
+            self.assertEqual(win._table.item(row2, TasksPage.COL_STATUS).text(), "已跳过(文件过小)")
+            self.assertEqual(win._table.item(row2, TasksPage.COL_ENGINE).text(), "WinRAR")
+            self.assertEqual(win._table.item(row2, TasksPage.COL_REMARK).text(), "文件过小跳过")
         finally:
             win.close()
 
@@ -763,15 +768,18 @@ class TestFeatureUIComponents(unittest.TestCase):
             valid_dir = os.path.abspath("tests")
             invalid_file = os.path.abspath("tests/non_existent_archive_xyz.zip")
 
+            from ui.pages.tasks_page import TasksPage
+
             # 任务1: 有效源文件 (file)
             row0 = win._table.rowCount()
             win._table.insertRow(row0)
             item0 = QTableWidgetItem("conftest.py")
             item0.setData(Qt.ItemDataRole.UserRole, "t_file")
-            win._table.setItem(row0, 0, item0)
-            win._table.setItem(row0, 1, QTableWidgetItem("解压完成"))
-            win._table.setItem(row0, 2, QTableWidgetItem("7-Zip"))
-            win._table.setItem(row0, 3, QTableWidgetItem("C:\\extracted"))
+            win._table.setItem(row0, TasksPage.COL_FILENAME, item0)
+            win._table.setItem(row0, TasksPage.COL_STATUS, QTableWidgetItem("解压完成"))
+            win._table.setItem(row0, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(row0, TasksPage.COL_ENGINE, QTableWidgetItem("7-Zip"))
+            win._table.setItem(row0, TasksPage.COL_REMARK, QTableWidgetItem("C:\\extracted"))
             win._task_data["t_file"] = {
                 "src_path": valid_file,
                 "dest_path": "C:\\extracted",
@@ -783,10 +791,11 @@ class TestFeatureUIComponents(unittest.TestCase):
             win._table.insertRow(row1)
             item1 = QTableWidgetItem("tests")
             item1.setData(Qt.ItemDataRole.UserRole, "t_dir")
-            win._table.setItem(row1, 0, item1)
-            win._table.setItem(row1, 1, QTableWidgetItem("排队中"))
-            win._table.setItem(row1, 2, QTableWidgetItem(""))
-            win._table.setItem(row1, 3, QTableWidgetItem(""))
+            win._table.setItem(row1, TasksPage.COL_FILENAME, item1)
+            win._table.setItem(row1, TasksPage.COL_STATUS, QTableWidgetItem("排队中"))
+            win._table.setItem(row1, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(row1, TasksPage.COL_ENGINE, QTableWidgetItem(""))
+            win._table.setItem(row1, TasksPage.COL_REMARK, QTableWidgetItem(""))
             win._task_data["t_dir"] = {
                 "src_path": valid_dir,
                 "dest_path": "",
@@ -798,10 +807,11 @@ class TestFeatureUIComponents(unittest.TestCase):
             win._table.insertRow(row2)
             item2 = QTableWidgetItem("ghost.zip")
             item2.setData(Qt.ItemDataRole.UserRole, "t_invalid")
-            win._table.setItem(row2, 0, item2)
-            win._table.setItem(row2, 1, QTableWidgetItem("解压失败"))
-            win._table.setItem(row2, 2, QTableWidgetItem(""))
-            win._table.setItem(row2, 3, QTableWidgetItem("文件不存在"))
+            win._table.setItem(row2, TasksPage.COL_FILENAME, item2)
+            win._table.setItem(row2, TasksPage.COL_STATUS, QTableWidgetItem("解压失败"))
+            win._table.setItem(row2, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(row2, TasksPage.COL_ENGINE, QTableWidgetItem(""))
+            win._table.setItem(row2, TasksPage.COL_REMARK, QTableWidgetItem("文件不存在"))
             win._task_data["t_invalid"] = {
                 "src_path": invalid_file,
                 "dest_path": "",
@@ -1027,6 +1037,7 @@ class TestFeatureAbortExtraction(unittest.TestCase):
     def test_main_window_abort_menu_action_and_retry(self):
         """验证 UI 界面右键菜单中“中止解压”的启用条件、点击响应，以及中止后“重新解压”功能。"""
         from ui.main_window import MainWindow
+        from ui.pages.tasks_page import TasksPage
         win = MainWindow()
         try:
             valid_src = str((self.scratch / "dummy.zip").resolve())
@@ -1036,10 +1047,11 @@ class TestFeatureAbortExtraction(unittest.TestCase):
             win._table.insertRow(0)
             item0 = QTableWidgetItem("正在提取.zip")
             item0.setData(Qt.ItemDataRole.UserRole, "t_running")
-            win._table.setItem(0, 0, item0)
-            win._table.setItem(0, 1, QTableWidgetItem("正在提取"))
-            win._table.setItem(0, 2, QTableWidgetItem("WinRAR"))
-            win._table.setItem(0, 3, QTableWidgetItem("正在解压..."))
+            win._table.setItem(0, TasksPage.COL_FILENAME, item0)
+            win._table.setItem(0, TasksPage.COL_STATUS, QTableWidgetItem("正在提取"))
+            win._table.setItem(0, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(0, TasksPage.COL_ENGINE, QTableWidgetItem("WinRAR"))
+            win._table.setItem(0, TasksPage.COL_REMARK, QTableWidgetItem("正在解压..."))
             win._task_data["t_running"] = {
                 "src_path": valid_src,
                 "filename": "正在提取.zip",
@@ -1053,10 +1065,11 @@ class TestFeatureAbortExtraction(unittest.TestCase):
             win._table.insertRow(1)
             item1 = QTableWidgetItem("排队中.zip")
             item1.setData(Qt.ItemDataRole.UserRole, "t_queued")
-            win._table.setItem(1, 0, item1)
-            win._table.setItem(1, 1, QTableWidgetItem("排队中"))
-            win._table.setItem(1, 2, QTableWidgetItem(""))
-            win._table.setItem(1, 3, QTableWidgetItem(""))
+            win._table.setItem(1, TasksPage.COL_FILENAME, item1)
+            win._table.setItem(1, TasksPage.COL_STATUS, QTableWidgetItem("排队中"))
+            win._table.setItem(1, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(1, TasksPage.COL_ENGINE, QTableWidgetItem(""))
+            win._table.setItem(1, TasksPage.COL_REMARK, QTableWidgetItem(""))
             win._task_data["t_queued"] = {
                 "src_path": valid_src,
                 "filename": "排队中.zip",
@@ -1070,10 +1083,11 @@ class TestFeatureAbortExtraction(unittest.TestCase):
             win._table.insertRow(2)
             item2 = QTableWidgetItem("已中止.zip")
             item2.setData(Qt.ItemDataRole.UserRole, "t_aborted")
-            win._table.setItem(2, 0, item2)
-            win._table.setItem(2, 1, QTableWidgetItem("已中止"))
-            win._table.setItem(2, 2, QTableWidgetItem("WinRAR"))
-            win._table.setItem(2, 3, QTableWidgetItem("用户手动中止"))
+            win._table.setItem(2, TasksPage.COL_FILENAME, item2)
+            win._table.setItem(2, TasksPage.COL_STATUS, QTableWidgetItem("已中止"))
+            win._table.setItem(2, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(2, TasksPage.COL_ENGINE, QTableWidgetItem("WinRAR"))
+            win._table.setItem(2, TasksPage.COL_REMARK, QTableWidgetItem("用户手动中止"))
             win._task_data["t_aborted"] = {
                 "src_path": valid_src,
                 "filename": "已中止.zip",
@@ -1087,10 +1101,11 @@ class TestFeatureAbortExtraction(unittest.TestCase):
             win._table.insertRow(3)
             item3 = QTableWidgetItem("成功.zip")
             item3.setData(Qt.ItemDataRole.UserRole, "t_success")
-            win._table.setItem(3, 0, item3)
-            win._table.setItem(3, 1, QTableWidgetItem("成功"))
-            win._table.setItem(3, 2, QTableWidgetItem("WinRAR"))
-            win._table.setItem(3, 3, QTableWidgetItem(str(self.scratch)))
+            win._table.setItem(3, TasksPage.COL_FILENAME, item3)
+            win._table.setItem(3, TasksPage.COL_STATUS, QTableWidgetItem("成功"))
+            win._table.setItem(3, TasksPage.COL_PROGRESS, QTableWidgetItem(""))
+            win._table.setItem(3, TasksPage.COL_ENGINE, QTableWidgetItem("WinRAR"))
+            win._table.setItem(3, TasksPage.COL_REMARK, QTableWidgetItem(str(self.scratch)))
             win._task_data["t_success"] = {
                 "src_path": valid_src,
                 "filename": "成功.zip",
@@ -1159,8 +1174,9 @@ class TestFeatureAbortExtraction(unittest.TestCase):
                     chosen_action_text[0] = "重新解压"
                     win._on_table_context_menu(pos2)
                     mock_submit.assert_called_once()
-                    self.assertEqual(win._get_cell_text(2, 1), "排队中")
-                    self.assertEqual(win._get_cell_text(2, 3), "准备重新解压...")
+                    self.assertEqual(win._get_cell_text(2, TasksPage.COL_STATUS), "排队中")
+                    self.assertEqual(win._get_cell_text(2, TasksPage.COL_ENGINE), "")
+                    self.assertEqual(win._get_cell_text(2, TasksPage.COL_REMARK), "准备重新解压...")
 
             # 重新解压后统计更新
             win._update_statistics()

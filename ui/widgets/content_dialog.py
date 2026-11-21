@@ -43,6 +43,7 @@ class ContentDialog(QDialog):
         cancel_text: str | None = "取消",
     ):
         super().__init__(parent)
+        self.setProperty("framelessDialog", True)
         ensure_theme(self)
         self.setModal(True)
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)

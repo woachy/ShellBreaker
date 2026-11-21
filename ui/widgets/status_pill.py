@@ -1,8 +1,8 @@
 """状态胶囊委托：把「处理状态」列绘制成 Fluent 胶囊标签。
 
 表格单元格文本保持原样（测试断言依赖 item.text()），着色只发生在绘制层。
-状态文本不做归一化：成功 / 失败 / 排队中 / 正在提取 / 验证密码 /
-已跳过 / 已跳过(非首卷分卷) / 已跳过(文件过小) 都原样显示。
+状态文本不做归一化：成功 / 失败 / 失败(缺失分卷: ...) / 排队中 / 正在提取 / 验证密码 /
+待确认继续 / 已跳过 / 已跳过(非首卷分卷) / 已跳过(文件过小) 都原样显示。
 """
 from __future__ import annotations
 
@@ -23,8 +23,10 @@ def status_palette(tokens: Tokens, status: str) -> tuple[str, str]:
     text = (status or "").strip()
     if text.startswith("成功"):
         return tokens.success, tokens.success_bg
-    if text.startswith("失败") or "中止" in text:
+    if text.startswith("失败") or "失败" in text or "中止" in text or "缺失分卷" in text:
         return tokens.danger, tokens.danger_bg
+    if text.startswith("待确认") or "待确认" in text:
+        return tokens.warning, tokens.warning_bg
     if text.startswith("已跳过") or "跳过" in text:
         return tokens.warning, tokens.warning_bg
     if text.startswith("正在提取") or text.startswith("验证密码") or "正在" in text:
@@ -59,22 +61,30 @@ class StatusPillDelegate(QStyledItemDelegate):
             font = status_pill_font(option.font)
             metrics = QFontMetrics(font)
             fg, bg = status_palette(theme, text)
-            pill_w = metrics.horizontalAdvance(text) + PILL_PADDING * 2
-            pill_w = min(pill_w, rect.width() - LEFT_PADDING * 2)
+            max_pill_w = max(0, rect.width() - LEFT_PADDING * 2)
+            raw_pill_w = metrics.horizontalAdvance(text) + PILL_PADDING * 2
+            pill_w = min(raw_pill_w, max_pill_w)
             x = rect.left() + LEFT_PADDING
             y = rect.top() + (rect.height() - PILL_HEIGHT) / 2.0
 
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(bg))
-            painter.drawRoundedRect(QRectF(x, y, pill_w, PILL_HEIGHT), 4.0, 4.0)
+            if pill_w > 0:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(bg))
+                painter.drawRoundedRect(QRectF(x, y, pill_w, PILL_HEIGHT), 4.0, 4.0)
 
-            painter.setFont(font)
-            painter.setPen(QColor(fg))
-            painter.drawText(
-                QRectF(x, y, pill_w, PILL_HEIGHT),
-                int(Qt.AlignmentFlag.AlignCenter),
-                text,
-            )
+                inner_w = max(0, int(pill_w - PILL_PADDING * 2))
+                display_text = (
+                    metrics.elidedText(text, Qt.TextElideMode.ElideRight, inner_w)
+                    if raw_pill_w > max_pill_w and inner_w > 0
+                    else text
+                )
+                painter.setFont(font)
+                painter.setPen(QColor(fg))
+                painter.drawText(
+                    QRectF(x, y, pill_w, PILL_HEIGHT),
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    display_text,
+                )
 
         # 行分隔线（QSS 的 item 边框对自绘委托无效，这里补上）
         painter.setPen(QColor(theme.divider))

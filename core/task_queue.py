@@ -13,6 +13,8 @@ from PySide6.QtCore import QObject, Signal
 
 from core.sandbox import (
     SandboxManager,
+    check_volume_completeness,
+    is_primary_part,
     is_secondary_volume,
 )
 from core.engine import (
@@ -53,11 +55,15 @@ class TaskQueue(QObject):
     task_progress = Signal(str, str)                        # (task_id, status_text)
     password_needed = Signal(str, str)                      # (task_id, archive_basename)
     password_wrong = Signal(str)                            # (task_id) — 密码错误，通知 UI 重新输入
+    task_registered = Signal(str, str)                      # (task_id, src_path)
+    task_layer_progress = Signal(str, int, int, str)        # (task_id, current_percent, completed_count, status_text)
+    nested_limit_reached = Signal(str, str, int)            # (task_id, filename, total_extract_count)
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._config = ConfigManager()
         self._executor: Optional[ThreadPoolExecutor] = None
+        self._max_workers: int = 0
         self._futures: dict[Future, str] = {}
         self._running = False
 
@@ -69,44 +75,68 @@ class TaskQueue(QObject):
 
         self._password_events: dict[str, threading.Event] = {}
         self._supplied_passwords: dict[str, Optional[str]] = {}
+        self._nested_confirm_events: dict[str, threading.Event] = {}
+        self._nested_confirm_choices: dict[str, str] = {}
         self._aborted_tasks: set[str] = set()
         self._task_filenames: dict[str, str] = {}
+        self._task_src_paths: dict[str, str] = {}
         self._lock = threading.RLock()
 
     # ---------- 生命周期 ----------
 
     def start(self):
-        if self._running:
-            return
-        max_w = int(self._config.get("max_workers", 2))
-        self._executor = ThreadPoolExecutor(max_workers=max_w)
-        self._running = True
+        with self._lock:
+            if self._running:
+                return
+            max_w = max(1, int(self._config.get("max_workers", 2)))
+            self._executor = ThreadPoolExecutor(max_workers=max_w)
+            self._max_workers = max_w
+            self._running = True
         # 预热引擎
         self._ensure_engine()
         logger.info(f"任务调度器已启动，最大并发: {max_w}，引擎: {self._engine_name}")
 
     def shutdown(self, wait: bool = True):
-        self._running = False
         with self._lock:
-            for evt in self._password_events.values():
+            self._running = False
+            for tid, evt in list(self._password_events.items()):
+                self._supplied_passwords[tid] = None
                 evt.set()
-        if self._executor:
-            self._executor.shutdown(wait=wait, cancel_futures=not wait)
+            for tid, evt in list(self._nested_confirm_events.items()):
+                self._nested_confirm_choices[tid] = "cancel"
+                evt.set()
+            executor = self._executor
             self._executor = None
+            self._max_workers = 0
+        if executor:
+            executor.shutdown(wait=wait, cancel_futures=not wait)
         logger.info("任务调度器已关闭")
 
     def reload_config(self):
-        """从 config.json 重新读取并发数并重启线程池。"""
-        max_w = int(self._config.get("max_workers", 2))
+        """从 config.json 重新读取并发数与引擎配置；仅在 max_workers 实际变化时温和替换线程池。"""
+        max_w = max(1, int(self._config.get("max_workers", 2)))
+        old_executor: Optional[ThreadPoolExecutor] = None
         with self._lock:
             self._engine = None  # 强制下次重新发现引擎
             self._engine_type = None
             self._engine_name = ""
-        if self._executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-        self._executor = ThreadPoolExecutor(max_workers=max_w)
+            if self._executor is not None and max_w != self._max_workers:
+                old_executor = self._executor
+                self._executor = ThreadPoolExecutor(max_workers=max_w)
+                self._max_workers = max_w
+            elif self._executor is None and self._running:
+                self._executor = ThreadPoolExecutor(max_workers=max_w)
+                self._max_workers = max_w
+        if old_executor is not None:
+            # 不使用 cancel_futures=True，让旧队列中已排队的任务自然跑完，避免 UI 永久卡死在"排队中"
+            old_executor.shutdown(wait=False)
         self._ensure_engine()
         logger.info(f"调度器已重载配置，并发: {max_w}，引擎: {self._engine_name}")
+
+    def get_task_src_path(self, task_id: str) -> str:
+        """获取任务对应的原始文件路径。"""
+        with self._lock:
+            return self._task_src_paths.get(task_id, "")
 
     # ---------- 引擎 ----------
 
@@ -131,25 +161,45 @@ class TaskQueue(QObject):
         注意：不在此处发射"排队中"信号——由 UI 层在插入表格行时一并设置初始状态。"""
         if not self._running:
             self.start()
+        file_path = Path(src_path)
         file_name = os.path.basename(src_path)
         from core.sandbox import PART_PATTERN
         if is_secondary_volume(file_name):
             logger.info(f"跳过非主分卷: {src_path}")
             return None
-        if not SandboxManager.is_primary_part(file_name):
+        if not is_primary_part(file_name):
             if PART_PATTERN.match(file_name):
                 logger.info(f"跳过非主分卷: {src_path}")
                 return None
 
         task_id = str(uuid.uuid4())[:8]
+        src_str = str(file_path)
         with self._lock:
             self._aborted_tasks.discard(task_id)
             self._task_filenames[task_id] = file_name
+            self._task_src_paths[task_id] = src_str
             if self._engine:
                 self._engine.reset_abort(task_id)
+        self.task_registered.emit(task_id, src_str)
+
+        # 分卷连续性入队预检：检测到断号直接终态失败，不提交线程池
+        is_complete, missing = check_volume_completeness(file_path)
+        if not is_complete:
+            missing_str = ", ".join(missing)
+            logger.warning(f"分卷不完整，拒绝入队 [id={task_id}]: {src_str} (缺少: {missing_str})")
+            self.task_status_changed.emit(
+                task_id,
+                file_path.name,
+                f"失败(缺失分卷: {missing_str})",
+                self._engine_name or "",
+                f"检测到分卷不完整，缺少: {missing_str}",
+            )
+            return task_id
+
         logger.info(f"任务已提交 [id={task_id}]: {src_path}")
-        future = self._executor.submit(self._process_task, task_id, src_path)
-        self._futures[future] = task_id
+        with self._lock:
+            future = self._executor.submit(self._process_task, task_id, src_str)
+            self._futures[future] = task_id
         future.add_done_callback(self._on_task_done)
         return task_id
 
@@ -158,15 +208,37 @@ class TaskQueue(QObject):
         UI 层负责在调用前创建表格行并设置"排队中"状态。"""
         if not self._running:
             self.start()
+        file_path = Path(src_path)
         file_name = os.path.basename(src_path)
+        src_str = str(file_path)
         with self._lock:
+            prev_src = self._task_src_paths.get(task_id)
             self._aborted_tasks.discard(task_id)
             self._task_filenames[task_id] = file_name
+            self._task_src_paths[task_id] = src_str
             if self._engine:
                 self._engine.reset_abort(task_id)
+        if prev_src != src_str:
+            self.task_registered.emit(task_id, src_str)
+
+        # 分卷连续性入队预检：检测到断号直接终态失败，不提交线程池
+        is_complete, missing = check_volume_completeness(file_path)
+        if not is_complete:
+            missing_str = ", ".join(missing)
+            logger.warning(f"分卷不完整，拒绝入队 [id={task_id}]: {src_str} (缺少: {missing_str})")
+            self.task_status_changed.emit(
+                task_id,
+                file_path.name,
+                f"失败(缺失分卷: {missing_str})",
+                self._engine_name or "",
+                f"检测到分卷不完整，缺少: {missing_str}",
+            )
+            return
+
         logger.info(f"任务已提交 [id={task_id}]: {src_path}")
-        future = self._executor.submit(self._process_task, task_id, src_path)
-        self._futures[future] = task_id
+        with self._lock:
+            future = self._executor.submit(self._process_task, task_id, src_str)
+            self._futures[future] = task_id
         future.add_done_callback(self._on_task_done)
 
     # ---------- 递归扫描（阶段 4.9）----------
@@ -204,6 +276,10 @@ class TaskQueue(QObject):
                     # 分卷检查：若为非首卷分卷，直接跳过并展示状态
                     if is_secondary_volume(entry.name):
                         task_id = str(uuid.uuid4())[:8]
+                        with self._lock:
+                            self._task_filenames[task_id] = entry.name
+                            self._task_src_paths[task_id] = src_str
+                        self.task_registered.emit(task_id, src_str)
                         self.task_status_changed.emit(task_id, entry.name, "已跳过(非首卷分卷)", self._engine_name, "由首卷统一解压")
                         logger.info(f"[递归扫描] 非首卷分卷，跳过: {entry.name}")
                         count += 1
@@ -211,11 +287,38 @@ class TaskQueue(QObject):
                     # 大小预检查
                     if self._is_file_too_small(src_str):
                         task_id = str(uuid.uuid4())[:8]
+                        with self._lock:
+                            self._task_filenames[task_id] = entry.name
+                            self._task_src_paths[task_id] = src_str
+                        self.task_registered.emit(task_id, src_str)
                         self.task_status_changed.emit(task_id, entry.name, "已跳过(文件过小)", self._engine_name, "")
                         logger.info(f"[递归扫描] 文件过小，跳过: {entry.name} ({os.path.getsize(src_str)} bytes)")
                         count += 1
                         continue
+                    # 分卷连续性预检查：存在缺卷直接发射终态失败，不入线程池
+                    is_complete, missing = check_volume_completeness(entry)
+                    if not is_complete:
+                        task_id = str(uuid.uuid4())[:8]
+                        with self._lock:
+                            self._task_filenames[task_id] = entry.name
+                            self._task_src_paths[task_id] = src_str
+                        self.task_registered.emit(task_id, src_str)
+                        missing_str = ", ".join(missing)
+                        self.task_status_changed.emit(
+                            task_id,
+                            entry.name,
+                            f"失败(缺失分卷: {missing_str})",
+                            self._engine_name or "",
+                            f"检测到分卷不完整，缺少: {missing_str}",
+                        )
+                        logger.warning(f"[递归扫描] 分卷不完整，跳过入队: {entry.name} (缺少: {missing_str})")
+                        count += 1
+                        continue
                     task_id = str(uuid.uuid4())[:8]
+                    with self._lock:
+                        self._task_filenames[task_id] = entry.name
+                        self._task_src_paths[task_id] = src_str
+                    self.task_registered.emit(task_id, src_str)
                     # 通知 UI 插入新行（"排队中"状态由 UI 层设置）
                     self.task_status_changed.emit(task_id, entry.name, "排队中", self._engine_name, "")
                     self.submit_existing(task_id, src_str)
@@ -231,7 +334,8 @@ class TaskQueue(QObject):
         """检查文件是否小于配置的 min_file_size_mb 阈值。"""
         from data.config_manager import ConfigManager
         cfg = ConfigManager()
-        min_mb = int(cfg.get("min_file_size_mb", 50))
+        val = cfg.get("min_file_size_mb", 50)
+        min_mb = int(50 if val is None else val)
         min_bytes = min_mb * 1024 * 1024
         try:
             size = os.path.getsize(file_path)
@@ -258,6 +362,52 @@ class TaskQueue(QObject):
             self._password_events.pop(task_id, None)
             return self._supplied_passwords.pop(task_id, None)
 
+    # ---------- 嵌套解压次数阈值确认（跨线程挂起/唤醒）----------
+
+    def supply_nested_confirm(self, task_id: str, choice: str) -> None:
+        """由 UI 线程回传用户对嵌套解压继续确认的选择 ('continue' | 'stop_keep' | 'cancel') 并唤醒工作线程。"""
+        with self._lock:
+            self._nested_confirm_choices[task_id] = choice
+            evt = self._nested_confirm_events.get(task_id)
+        if evt is not None:
+            evt.set()
+
+    def _wait_for_nested_confirm(self, task_id: str, filename: str, total_count: int) -> str:
+        """工作线程达到连续解压阈值时挂起等待 UI 确认；支持中止与退出即时响应。"""
+        if self.is_aborted(task_id):
+            return "cancel"
+
+        evt = threading.Event()
+        with self._lock:
+            if task_id in self._aborted_tasks:
+                return "cancel"
+            self._nested_confirm_events[task_id] = evt
+            self._nested_confirm_choices.pop(task_id, None)
+
+        display_name = os.path.basename(self.get_task_src_path(task_id)) or filename
+        self.task_status_changed.emit(
+            task_id,
+            display_name,
+            "待确认继续",
+            self._engine_name or "",
+            f"已连续解压 {total_count} 次，等待确认",
+        )
+        self.nested_limit_reached.emit(task_id, filename, total_count)
+
+        try:
+            while not evt.wait(timeout=0.5):
+                if self.is_aborted(task_id):
+                    return "cancel"
+        finally:
+            with self._lock:
+                self._nested_confirm_events.pop(task_id, None)
+
+        with self._lock:
+            choice = self._nested_confirm_choices.pop(task_id, "cancel")
+        if self.is_aborted(task_id):
+            return "cancel"
+        return choice
+
     # ---------- 中止与状态查询 ----------
 
     def is_aborted(self, task_id: str) -> bool:
@@ -265,15 +415,21 @@ class TaskQueue(QObject):
         with self._lock:
             return task_id in self._aborted_tasks
 
+    _is_task_aborted = is_aborted
+
     def abort_task(self, task_id: str) -> bool:
         """
         中止指定 task_id 的任务。
         若任务还在排队（Future 尚未运行）：调用 future.cancel()，从队列移除，并由调度器通知状态为 "已中止"，备注为 "排队中已中止"；
-        若任务正在运行：标记 aborted，唤醒等待密码的 threading.Event，并调用 self._engine.terminate_process(task_id)；
+        若任务正在运行：标记 aborted，唤醒等待密码或嵌套确认的 threading.Event，并调用 self._engine.terminate_process(task_id)；
         pipeline 检查到 aborted 或捕获进程被杀异常后抛出 ExtractionAbortedError，在 finally 中自动回收沙箱目录，通知状态为 "已中止"，备注为 "用户手动中止"。
         返回是否成功触发中止。
         """
         logger.info(f"收到中止任务请求 [id={task_id}]")
+        cancelled_fname: Optional[str] = None
+        engine_name = ""
+        engine: Optional[BaseEngine] = None
+
         with self._lock:
             self._aborted_tasks.add(task_id)
             target_future: Optional[Future] = None
@@ -284,18 +440,68 @@ class TaskQueue(QObject):
 
             if target_future is not None and target_future.cancel():
                 self._futures.pop(target_future, None)
-                fname = self._task_filenames.get(task_id, "")
+                cancelled_fname = self._task_filenames.get(task_id, "")
+                engine_name = self._engine_name
                 logger.info(f"[{task_id}] 任务尚未开始运行，已从线程池队列取消")
-                self.task_status_changed.emit(task_id, fname, "已中止", self._engine_name, "排队中已中止")
-                self.task_progress.emit(task_id, "任务结束")
-                return True
+            else:
+                # 任务正在运行：唤醒可能挂起的密码等待与嵌套确认等待
+                self.supply_password(task_id, None)
+                self.supply_nested_confirm(task_id, "cancel")
+                engine = self._engine
 
-            # 任务正在运行
-            self.supply_password(task_id, None)
-            if self._engine is not None:
-                self._engine.terminate_process(task_id)
-
+        if cancelled_fname is not None:
+            self.task_status_changed.emit(task_id, cancelled_fname, "已中止", engine_name, "排队中已中止")
             return True
+
+        if engine is not None:
+            engine.terminate_process(task_id)
+
+        return True
+
+    def abort_all(self) -> None:
+        """中止所有进行中/排队中任务，唤醒全部等待线程，强杀所有引擎子进程并清理残留沙箱。"""
+        logger.info("收到全部任务中止请求 (abort_all)")
+        cancelled_items: list[tuple[str, str]] = []
+        engine: Optional[BaseEngine] = None
+        engine_name = ""
+
+        with self._lock:
+            all_tids = set(self._futures.values())
+            all_tids.update(self._password_events.keys())
+            all_tids.update(self._nested_confirm_events.keys())
+            for tid in all_tids:
+                self._aborted_tasks.add(tid)
+
+            for fut, tid in list(self._futures.items()):
+                if fut.cancel():
+                    self._futures.pop(fut, None)
+                    fname = self._task_filenames.get(tid, "")
+                    cancelled_items.append((tid, fname))
+
+            for tid, evt in list(self._password_events.items()):
+                self._supplied_passwords[tid] = None
+                evt.set()
+
+            for tid, evt in list(self._nested_confirm_events.items()):
+                self._nested_confirm_choices[tid] = "cancel"
+                evt.set()
+
+            engine = self._engine
+            engine_name = self._engine_name
+
+        for tid, fname in cancelled_items:
+            self.task_status_changed.emit(tid, fname, "已中止", engine_name, "排队中已中止")
+
+        if engine is not None:
+            try:
+                engine.terminate_all()
+            except Exception as e:
+                logger.warning(f"abort_all 终止引擎子进程异常: {e}")
+
+        try:
+            self._sandbox.clean_all()
+        except Exception as e:
+            logger.warning(f"abort_all 清理残留沙箱异常: {e}")
 
     # ---------- 管线构建与单任务处理 ----------
 
@@ -314,16 +520,22 @@ class TaskQueue(QObject):
             on_password_wrong=self.password_wrong.emit,
             wait_for_password=self._wait_for_user_password,
             is_aborted=self.is_aborted,
+            on_layer_progress=lambda tid, pct, cnt, txt: self.task_layer_progress.emit(tid, pct, cnt, txt),
+            wait_for_nested_confirm=self._wait_for_nested_confirm,
         )
 
     def _process_task(self, task_id: str, src_path: str):
         """单任务调度入口，委托 ExtractionPipeline 执行。"""
+        with self._lock:
+            self._task_src_paths.setdefault(task_id, str(src_path))
+            self._task_filenames.setdefault(task_id, os.path.basename(src_path))
         self._ensure_engine()
         pipeline = self._create_pipeline()
         return pipeline.process(task_id, src_path)
 
     def _on_task_done(self, future: Future):
-        task_id = self._futures.pop(future, None)
+        with self._lock:
+            task_id = self._futures.pop(future, None)
         if future.cancelled():
             logger.info(f"[{task_id}] Future 已取消")
             return

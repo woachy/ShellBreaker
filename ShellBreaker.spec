@@ -1,15 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 
+_assets_bin_dir = Path('assets/bin')
+_assets_bin_datas = (
+    [(str(p), 'assets/bin') for p in sorted(_assets_bin_dir.iterdir()) if p.is_file()]
+    if _assets_bin_dir.is_dir()
+    else []
+)
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=[
-        ('assets/style.qss', 'assets'),
         ('assets/app_icon.png', 'assets'),
         ('assets/app_icon.ico', 'assets'),
-    ],
+    ] + _assets_bin_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
