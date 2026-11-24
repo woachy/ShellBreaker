@@ -5,6 +5,7 @@ dist/
 # 本地验证脚本与截图（非产品代码）
 .ui-plan/
 .dsh-acl-report/
+.agents/
 
 # 运行日志（可能包含个人文件路径，勿上传）
 logs/

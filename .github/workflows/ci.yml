@@ -23,9 +23,17 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Install compression tools (Bandizip & WinRAR)
+      - name: Install compression tools (WinRAR & Bandizip)
         run: |
-          choco install bandizip winrar -y --no-progress
+          choco install winrar -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Bandisoft uses a floating latest-release URL (dl.php?choco), so Chocolatey's
+          # manifest SHA256 drifts whenever Bandizip updates upstream.
+          choco install bandizip -y --no-progress --ignore-checksums
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Bandizip installation failed (exit=$LASTEXITCODE); continuing with WinRAR and bundled 7-Zip."
+          }
+          $global:LASTEXITCODE = 0
         shell: pwsh
 
       - name: Upgrade pip and install dependencies

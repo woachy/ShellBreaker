@@ -12,7 +12,7 @@
 - **三引擎快速预检与偏移图种适配**：统一 Bandizip、WinRAR 与 7-Zip 快速验密预检路径，适配带非零偏移的图种归档探测与提取。
 
 ### 优化
-- **回归测试与工程规范沉淀**：补充 `tests/test_v121_bugfixes.py` 专项回归测试套件覆盖上述魔数校验、伪装链②硬链接回退、Bandizip CLI 纠偏与 WinRAR 退出码分流场景，并新增项目专属工程开发技能文档 `.agents/skills/shellbreaker-dev/SKILL.md`。
+- **专项回归测试补充**：补充 `tests/test_v121_bugfixes.py` 专项回归测试套件，覆盖上述魔数校验、伪装链②硬链接回退、Bandizip CLI 纠偏与 WinRAR 退出码分流场景。
 
 ## [1.2.0] - 2026-11-21
 
