@@ -9,12 +9,14 @@ import shutil
 import logging
 import re
 import stat
+import struct
 import sys
 import tempfile
 import threading
 import time
 import ctypes
 import zipfile
+import zlib
 from ctypes import wintypes
 from pathlib import Path
 from typing import Optional
@@ -202,10 +204,12 @@ def get_part_group(src_path: str | Path) -> list[Path]:
 _EMBEDDED_CHUNK_SIZE = 1024 * 1024  # 1MB
 _EMBEDDED_OVERLAP = 32
 _EMBEDDED_TAIL_SCAN_BYTES = 8 * 1024 * 1024  # 8MB
-_EMBEDDED_ARCHIVE_MAGICS: tuple[tuple[bytes, str], ...] = (
-    (b"Rar!\x1a\x07\x00", ".rar"),      # RAR4
-    (b"Rar!\x1a\x07\x01\x00", ".rar"),  # RAR5
-    (b"\x37\x7a\xbc\xaf\x27\x1c", ".7z"),  # 7z
+_RAR4_MAX_HEAD_SIZE = 65535
+_RAR5_MAX_HEAD_SIZE = 1024 * 1024
+_EMBEDDED_ARCHIVE_MAGICS: tuple[tuple[bytes, str, str], ...] = (
+    (b"Rar!\x1a\x07\x00", ".rar", "rar4"),      # RAR4
+    (b"Rar!\x1a\x07\x01\x00", ".rar", "rar5"),  # RAR5
+    (b"\x37\x7a\xbc\xaf\x27\x1c", ".7z", "7z"),  # 7z
 )
 
 
@@ -226,23 +230,257 @@ def _is_media_carrier_header(header: bytes) -> bool:
     return False
 
 
-def _verify_zip_structure(path: Path, file_obj, file_size: int) -> bool:
-    """对内嵌 PK\\x03\\x04 执行二次防误报校验（检查末尾 EOCD PK\\x05\\x06 或 zipfile.is_zipfile）。"""
-    try:
-        tail_len = min(file_size, 128 * 1024)
-        if tail_len >= 4:
-            cur_pos = file_obj.tell()
-            file_obj.seek(file_size - tail_len)
-            tail_data = file_obj.read(tail_len)
-            file_obj.seek(cur_pos)
-            if b"PK\x05\x06" in tail_data:
-                return True
-    except OSError:
-        pass
-    try:
-        return zipfile.is_zipfile(path)
-    except Exception:
+def _verify_7z_header(file_obj, offset: int, file_size: int) -> bool:
+    """
+    强校验偏移 offset 处的 7z 32 字节 StartHeader：
+    - 校验偏移边界 offset + 32 <= file_size；
+    - 校验 6 字节签名 + 主版本号 major == 0；
+    - 校验 StartHeaderCRC == crc32(hdr[12:32])；
+    - 校验 next_offset / next_size 不越界（防整数溢出与伪魔数误报）。
+    """
+    if offset < 0 or offset + 32 > file_size:
         return False
+    cur_pos = file_obj.tell()
+    try:
+        file_obj.seek(offset)
+        hdr = file_obj.read(32)
+        if len(hdr) != 32:
+            return False
+        if hdr[:6] != b"\x37\x7a\xbc\xaf\x27\x1c":
+            return False
+        if hdr[6] != 0:
+            return False
+        start_hdr_crc = struct.unpack("<I", hdr[8:12])[0]
+        if start_hdr_crc != (zlib.crc32(hdr[12:32]) & 0xFFFFFFFF):
+            return False
+        next_offset, next_size = struct.unpack("<QQ", hdr[12:28])
+        if next_offset > file_size or next_size > file_size:
+            return False
+        if offset + 32 + next_offset + next_size > file_size:
+            return False
+        return True
+    except (OSError, struct.error):
+        return False
+    finally:
+        try:
+            file_obj.seek(cur_pos)
+        except OSError:
+            pass
+
+
+def _read_rar5_vint(data: bytes, pos: int) -> tuple[Optional[int], int]:
+    """读取 RAR5 小端 7-bit 变长整数 (vint)，返回 (value, bytes_consumed)。"""
+    val = 0
+    shift = 0
+    start = pos
+    limit = min(len(data), pos + 10)
+    while pos < limit:
+        byte_val = data[pos]
+        pos += 1
+        val |= (byte_val & 0x7F) << shift
+        if not (byte_val & 0x80):
+            return val, pos - start
+        shift += 7
+    return None, 0
+
+
+def _verify_rar_header(file_obj, offset: int, file_size: int, is_rar5: bool) -> bool:
+    """
+    强校验偏移 offset 处的 RAR4 / RAR5 主归档头：
+    - RAR4 (7B 签名)：校验紧随其后的 MAIN_HEAD (head_type=0x73, head_size>=13, 边界与 CRC16)；
+    - RAR5 (8B 签名)：校验 4B head_crc + vint head_size + CRC32 + 块类型 vint ∈ {1(Main), 4(Encryption)}。
+    """
+    if offset < 0:
+        return False
+    cur_pos = file_obj.tell()
+    try:
+        if not is_rar5:
+            if offset + 14 > file_size:
+                return False
+            file_obj.seek(offset)
+            marker = file_obj.read(7)
+            if marker != b"Rar!\x1a\x07\x00":
+                return False
+            base = file_obj.read(7)
+            if len(base) != 7:
+                return False
+            head_crc, head_type, _head_flags, head_size = struct.unpack("<HBHH", base)
+            if head_type != 0x73 or head_size < 13 or head_size > _RAR4_MAX_HEAD_SIZE:
+                return False
+            if offset + 7 + head_size > file_size:
+                return False
+            rest = file_obj.read(head_size - 7)
+            if len(rest) != head_size - 7:
+                return False
+            main_hdr = base + rest
+            return (zlib.crc32(main_hdr[2:head_size]) & 0xFFFF) == head_crc
+
+        if offset + 16 > file_size:
+            return False
+        file_obj.seek(offset)
+        marker = file_obj.read(8)
+        if marker != b"Rar!\x1a\x07\x01\x00":
+            return False
+        prefix = file_obj.read(14)
+        if len(prefix) < 5:
+            return False
+        head_crc = struct.unpack("<I", prefix[:4])[0]
+        head_size, vint_len = _read_rar5_vint(prefix, 4)
+        if head_size is None or vint_len <= 0:
+            return False
+        if head_size < 1 or head_size > _RAR5_MAX_HEAD_SIZE:
+            return False
+        body_start = offset + 8 + 4 + vint_len
+        if body_start + head_size > file_size:
+            return False
+        vint_bytes = prefix[4 : 4 + vint_len]
+        file_obj.seek(body_start)
+        head_body = file_obj.read(head_size)
+        if len(head_body) != head_size:
+            return False
+        if (zlib.crc32(vint_bytes + head_body) & 0xFFFFFFFF) != head_crc:
+            return False
+        head_type, type_len = _read_rar5_vint(head_body, 0)
+        return type_len > 0 and head_type in (1, 4)
+    except (OSError, struct.error):
+        return False
+    finally:
+        try:
+            file_obj.seek(cur_pos)
+        except OSError:
+            pass
+
+
+def _find_zip_eocd_and_offset(file_path: Path, file_size: int) -> Optional[int]:
+    """
+    O(1) ZIP EOCD 探测与精确偏移反算（兼容标准 ZIP、ZIP64 与超大 MP4+ZIP 偏移图种）：
+    - 从文件尾最多读取 min(file_size, 65536 + 22) 字节定位合法 EOCD (PK\\x05\\x06)；
+    - 验证中央目录真实偏移处的 PK\\x01\\x02 签名，反算 zip_start_offset 并校验 PK\\x03\\x04；
+    - 未命中合法 ZIP 结构返回 None。
+    """
+    if file_size < 22:
+        return None
+    try:
+        with open(file_path, "rb") as f:
+            tail_len = min(file_size, 65536 + 22)
+            tail_start = file_size - tail_len
+            f.seek(tail_start)
+            tail = f.read(tail_len)
+
+            search_end = len(tail)
+            while search_end >= 4:
+                idx = tail.rfind(b"PK\x05\x06", 0, search_end)
+                if idx == -1:
+                    break
+                search_end = idx
+                if idx + 22 > len(tail):
+                    continue
+
+                eocd_pos = tail_start + idx
+                (
+                    _disk_num,
+                    _cd_disk,
+                    _entries_disk,
+                    entries_total,
+                    cd_size,
+                    cd_offset,
+                    comment_len,
+                ) = struct.unpack("<HHHHIIH", tail[idx + 4 : idx + 22])
+
+                if eocd_pos + 22 + comment_len > file_size:
+                    continue
+
+                # 处理 ZIP64 EOCD Locator (PK\x06\x07) & ZIP64 EOCD (PK\x06\x06)
+                is_zip64 = (
+                    cd_size == 0xFFFFFFFF
+                    or cd_offset == 0xFFFFFFFF
+                    or entries_total == 0xFFFF
+                )
+                if is_zip64:
+                    loc_pos = eocd_pos - 20
+                    if loc_pos >= 0:
+                        f.seek(loc_pos)
+                        loc = f.read(20)
+                        if len(loc) == 20 and loc[:4] == b"PK\x06\x07":
+                            z64_eocd_rel_offset = struct.unpack("<Q", loc[8:16])[0]
+                            win_len = min(loc_pos, 4096)
+                            win_start = loc_pos - win_len
+                            f.seek(win_start)
+                            win = f.read(win_len)
+                            z64_search = len(win)
+                            while z64_search >= 4:
+                                z_idx = win.rfind(b"PK\x06\x06", 0, z64_search)
+                                if z_idx == -1:
+                                    break
+                                z64_search = z_idx
+                                if z_idx + 56 > len(win):
+                                    continue
+                                z64_pos = win_start + z_idx
+                                z64_rec_size = struct.unpack("<Q", win[z_idx + 4 : z_idx + 12])[0]
+                                if z64_pos + 12 + z64_rec_size != loc_pos:
+                                    continue
+                                z64_cd_size, z64_cd_offset = struct.unpack(
+                                    "<QQ", win[z_idx + 40 : z_idx + 56]
+                                )
+                                cd_actual_pos = z64_pos - z64_cd_size
+                                if cd_actual_pos < 0:
+                                    continue
+                                if z64_cd_size == 0:
+                                    if (
+                                        z64_cd_offset == 0
+                                        and eocd_pos + 22 + comment_len == file_size
+                                    ):
+                                        return z64_pos
+                                    continue
+                                f.seek(cd_actual_pos)
+                                cd_hdr = f.read(46)
+                                if len(cd_hdr) < 4 or cd_hdr[:4] != b"PK\x01\x02":
+                                    continue
+                                zip_start_offset = z64_pos - z64_eocd_rel_offset
+                                if zip_start_offset < 0:
+                                    zip_start_offset = cd_actual_pos - z64_cd_offset
+                                if zip_start_offset >= 0:
+                                    f.seek(zip_start_offset)
+                                    start_sig = f.read(4)
+                                    if start_sig in (b"PK\x03\x04", b"PK\x07\x08"):
+                                        return zip_start_offset
+                    continue
+
+                # 标准 ZIP EOCD
+                cd_actual_pos = eocd_pos - cd_size
+                if cd_actual_pos < 0:
+                    continue
+
+                if cd_size == 0:
+                    if (
+                        entries_total == 0
+                        and cd_offset == 0
+                        and eocd_pos + 22 + comment_len == file_size
+                    ):
+                        return eocd_pos
+                    continue
+
+                f.seek(cd_actual_pos)
+                cd_hdr = f.read(46)
+                if len(cd_hdr) < 4 or cd_hdr[:4] != b"PK\x01\x02":
+                    continue
+
+                zip_start_offset = cd_actual_pos - cd_offset
+                if zip_start_offset >= 0:
+                    f.seek(zip_start_offset)
+                    start_sig = f.read(4)
+                    if start_sig in (b"PK\x03\x04", b"PK\x07\x08"):
+                        return zip_start_offset
+                    # 兼容 zip -A 已将 cd_offset 调整为文件绝对偏移的图种
+                    if zip_start_offset == 0 and len(cd_hdr) == 46:
+                        first_lh_offset = struct.unpack("<I", cd_hdr[42:46])[0]
+                        if 0 < first_lh_offset < cd_actual_pos:
+                            f.seek(first_lh_offset)
+                            if f.read(4) == b"PK\x03\x04":
+                                return first_lh_offset
+    except (OSError, struct.error):
+        return None
+    return None
 
 
 def _scan_range_for_embedded_magic(
@@ -251,11 +489,14 @@ def _scan_range_for_embedded_magic(
     file_size: int,
     start_pos: int,
     end_pos: int,
-    zip_verified: Optional[bool],
-) -> tuple[Optional[str], int, Optional[bool]]:
-    """流式分块扫描指定区间 [start_pos, end_pos)，保留 32 字节跨块重叠以防止魔数截断。"""
+) -> tuple[Optional[str], int]:
+    """
+    流式分块扫描指定区间 [start_pos, end_pos) 中的内嵌 7z / RAR4 / RAR5 魔数，
+    保留 32 字节跨块重叠以防止魔数截断；对每个偏移 > 0 的命中点执行头部强校验，
+    校验失败时从 pos + 1 继续扫描，绝不因假命中提前返回。
+    """
     if start_pos >= end_pos:
-        return None, -1, zip_verified
+        return None, -1
 
     file_obj.seek(start_pos)
     prev_tail = b""
@@ -272,27 +513,30 @@ def _scan_range_for_embedded_magic(
         search_start = 1 if buf_start == 0 else 0
 
         candidates: list[tuple[int, str]] = []
-        for magic, ext in _EMBEDDED_ARCHIVE_MAGICS:
+        for magic, ext, kind in _EMBEDDED_ARCHIVE_MAGICS:
             pos = buf.find(magic, search_start)
-            if pos != -1:
-                candidates.append((pos, ext))
-
-        if zip_verified is not False:
-            zip_pos = buf.find(b"PK\x03\x04", search_start)
-            if zip_pos != -1:
-                if zip_verified is None:
-                    zip_verified = _verify_zip_structure(path, file_obj, file_size)
-                if zip_verified:
-                    candidates.append((zip_pos, ".zip"))
+            while pos != -1:
+                abs_offset = buf_start + pos
+                if abs_offset > 0:
+                    if kind == "7z":
+                        verified = _verify_7z_header(file_obj, abs_offset, file_size)
+                    elif kind == "rar4":
+                        verified = _verify_rar_header(file_obj, abs_offset, file_size, is_rar5=False)
+                    else:
+                        verified = _verify_rar_header(file_obj, abs_offset, file_size, is_rar5=True)
+                    if verified:
+                        candidates.append((pos, ext))
+                        break
+                pos = buf.find(magic, pos + 1)
 
         if candidates:
             best_pos, best_ext = min(candidates, key=lambda item: item[0])
-            return best_ext, buf_start + best_pos, zip_verified
+            return best_ext, buf_start + best_pos
 
         cursor += len(chunk)
         prev_tail = buf[-_EMBEDDED_OVERLAP:] if len(buf) >= _EMBEDDED_OVERLAP else buf
 
-    return None, -1, zip_verified
+    return None, -1
 
 
 def detect_embedded_archive(
@@ -300,13 +544,14 @@ def detect_embedded_archive(
     max_scan_bytes: int = 64 * 1024 * 1024,
 ) -> tuple[Optional[str], int]:
     """
-    图种 / 复合伪装魔数偏移嗅探：
+    图种 / 复合伪装魔数偏移嗅探（全仓唯一真相源）：
     返回 (archive_ext, offset)，未命中或受保护终点文件返回 (None, -1)。
     """
     path = Path(file_path)
     if not path.is_file():
         return None, -1
 
+    # 0. 终点白名单最先拦截：.apk/.exe/.msi 绝不可被任何魔数或 ZIP EOCD 误放行
     ext = path.suffix.lower()
     if ext in PROTECTED_ENDPOINT_EXTS:
         return None, -1
@@ -318,7 +563,7 @@ def detect_embedded_archive(
             if not header:
                 return None, -1
 
-            # 1. 检测偏移 0 的传统压缩包魔数
+            # 1. 检测偏移 0 的传统压缩包魔数（偏移 0 保持宽容，避免误伤头部受损待修包）
             if header.startswith(b"\x37\x7a\xbc\xaf\x27\x1c"):
                 return ".7z", 0
             if header.startswith(b"Rar!\x1a\x07"):
@@ -332,14 +577,16 @@ def detect_embedded_archive(
             if header.startswith(b"\xfd7zXZ\x00"):
                 return ".xz", 0
 
-            # 2. 若属于常见媒体载体头，执行流式分块扫描查找偏移 > 0 的内嵌压缩包魔数
-            is_media = _is_media_carrier_header(header)
-            if is_media:
-                zip_verified: Optional[bool] = None
+            # 2. 若属于常见媒体载体头：优先 O(1) ZIP EOCD 探测，其次强校验流式扫描 7z/RAR4/RAR5
+            if _is_media_carrier_header(header):
+                zip_offset = _find_zip_eocd_and_offset(path, file_size)
+                if zip_offset is not None:
+                    return ".zip", zip_offset
+
                 scan_limit = max(0, int(max_scan_bytes))
                 head_end = min(file_size, scan_limit)
-                found_ext, found_offset, zip_verified = _scan_range_for_embedded_magic(
-                    path, f, file_size, 0, head_end, zip_verified
+                found_ext, found_offset = _scan_range_for_embedded_magic(
+                    path, f, file_size, 0, head_end
                 )
                 if found_ext is not None:
                     return found_ext, found_offset
@@ -349,8 +596,8 @@ def detect_embedded_archive(
                         max(0, scan_limit - _EMBEDDED_OVERLAP),
                         file_size - _EMBEDDED_TAIL_SCAN_BYTES,
                     )
-                    found_ext, found_offset, _ = _scan_range_for_embedded_magic(
-                        path, f, file_size, tail_start, file_size, zip_verified
+                    found_ext, found_offset = _scan_range_for_embedded_magic(
+                        path, f, file_size, tail_start, file_size
                     )
                     if found_ext is not None:
                         return found_ext, found_offset
@@ -360,13 +607,15 @@ def detect_embedded_archive(
         logger.warning(f"无法读取文件头部魔数 ({path}): {e}")
         return None, -1
 
-    # 3. 非媒体小文件保留 zipfile.is_zipfile() 兜底检测
-    if file_size <= max(0, int(max_scan_bytes)):
-        try:
-            if zipfile.is_zipfile(path):
-                return ".zip", 0
-        except Exception:
-            pass
+    # 3. 非媒体文件 O(1) ZIP EOCD / zipfile.is_zipfile() 兜底检测（无体积上限截断）
+    zip_offset = _find_zip_eocd_and_offset(path, file_size)
+    if zip_offset is not None:
+        return ".zip", zip_offset
+    try:
+        if zipfile.is_zipfile(path):
+            return ".zip", 0
+    except Exception:
+        pass
 
     return None, -1
 

@@ -2,6 +2,18 @@
 
 本文档记录 ShellBreaker 各正式版本的功能新增、优化调整与缺陷修复。
 
+## [1.2.1] - 2026-11-24
+
+### 修复
+- **大体积媒体伪装包魔数误报与截断缺陷**：统一 `detect_embedded_archive` 为全链路魔数与图种探测唯一入口；在保留偏移 `0` 传统归档魔数宽容识别的同时，对偏移 `> 0` 的 7z 增加 32B StartHeader CRC32 及边界校验、对 RAR4/RAR5 增加主头/块头结构与 CRC 强校验；优先通过 O(1) 尾部 ZIP/ZIP64 EOCD 反算真实起始偏移并修复窗口偏移 `0` 边界漏检；取消非媒体文件的 64MB 体积截断限制，避免 2GB+ MP4 等大载体文件因随机字节碰撞被误判为 7z/RAR。
+- **伪装来源回退链②短路问题**：当源文件本身为伪装后缀（`is_disguised_source=True`）且第一阶段改名尝试非密码失败时，不再因扩展名非 `.zip` 而短路链②，改为优先通过同盘硬链接（跨盘回退复制）临时改名 `.zip` 重试，且清理阶段仅删除沙箱内临时硬链接，不触碰原始文件。
+- **Bandizip GUI 路径误用导致秒退**：抽取并统一 `resolve_bandizip_cli` 解析函数，在 `BandizipEngine`、`discover_engine` 与 `SettingsPage` 三处自动将误选的 `Bandizip.exe`（GUI 程序）纠偏为同目录命令行程序 `bz.exe` / `bc.exe`，缺失 CLI 时拒绝调用 GUI 并降级处理。
+- **WinRAR 对非支持格式盲扫修复与加密 ZIP 退出码误判**：新增 `BaseEngine.supports_repair_for` 守卫，拦截 WinRAR `r` 命令对 `.7z` 等不支持格式的长时间盲扫修复，并在执行修复前上报 `-1` 不确定脉冲进度态；针对实机 WinRAR 解压加密 ZIP 统一返回 `exit=10` 的行为，结合 O(1) `_is_encrypted_zip` 判定按是否传密精准分流 `PasswordRequiredError` 与 `WrongPasswordError`，同时维持坏包直抛 `ExtractionFailedError`。
+- **三引擎快速预检与偏移图种适配**：统一 Bandizip、WinRAR 与 7-Zip 快速验密预检路径，适配带非零偏移的图种归档探测与提取。
+
+### 优化
+- **回归测试与工程规范沉淀**：补充 `tests/test_v121_bugfixes.py` 专项回归测试套件覆盖上述魔数校验、伪装链②硬链接回退、Bandizip CLI 纠偏与 WinRAR 退出码分流场景，并新增项目专属工程开发技能文档 `.agents/skills/shellbreaker-dev/SKILL.md`。
+
 ## [1.2.0] - 2026-11-21
 
 ### 新增

@@ -8,10 +8,12 @@ import logging
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 from enum import Enum, auto
 from typing import Optional, Callable
@@ -59,6 +61,117 @@ SEVENZIP_PATHS = [
     r"C:\Program Files (x86)\7-Zip\7z.exe",
     r"C:\7-Zip\7z.exe",
 ]
+
+
+def resolve_bandizip_cli(path_or_dir: str | Path) -> Optional[str]:
+    """
+    统一解析 Bandizip 命令行程序 (bz.exe / bc.exe)：
+    - 若传入路径已是存在的 bz.exe 或 bc.exe，直接返回解析后的绝对路径；
+    - 若传入路径是 Bandizip.exe（不区分大小写）或目录：自动查找同级目录及一层子目录下的
+      bz.exe（其次 bc.exe），找到则记录 info 日志并返回；找不到返回 None，绝不把 GUI
+      Bandizip.exe 当作 CLI 使用。
+    """
+    if path_or_dir is None:
+        return None
+    raw_str = str(path_or_dir).strip()
+    if not raw_str:
+        return None
+    p = Path(raw_str)
+
+    def _search_dir(base_dir: Path) -> Optional[str]:
+        if not base_dir.is_dir():
+            return None
+        for cli_name in ("bz.exe", "bc.exe"):
+            cand = base_dir / cli_name
+            if cand.is_file():
+                return str(cand.resolve())
+        try:
+            subdirs = sorted(
+                (entry for entry in base_dir.iterdir() if entry.is_dir()),
+                key=lambda d: d.name.lower(),
+            )
+        except OSError:
+            subdirs = []
+        for cli_name in ("bz.exe", "bc.exe"):
+            for sub in subdirs:
+                cand = sub / cli_name
+                if cand.is_file():
+                    return str(cand.resolve())
+        return None
+
+    if p.is_file():
+        fname = p.name.lower()
+        if fname in ("bz.exe", "bc.exe"):
+            return str(p.resolve())
+        if fname == "bandizip.exe":
+            found = _search_dir(p.parent)
+            if found:
+                logger.info(f"检测到 Bandizip GUI ({p.name})，已自动纠偏为命令行程序: {found}")
+                return found
+            return None
+        return None
+
+    if p.is_dir():
+        found = _search_dir(p)
+        if found:
+            logger.info(f"从目录 {p} 自动解析 Bandizip CLI: {found}")
+            return found
+        return None
+
+    return None
+
+
+def _is_encrypted_zip(archive_path: Path | str) -> bool:
+    """
+    O(1) 精确判别文件是否为包含加密成员的合法 ZIP（原生兼容 MP4+ZIP 偏移图种）：
+    读取中央目录 infolist() 检查任一成员 flag_bits & 0x1 是否置位；
+    非 ZIP、损坏假包或 IO 异常安全返回 False，守护 Bug #3 防盲跑密码库红线。
+    """
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            return any(bool(info.flag_bits & 0x1) for info in zf.infolist())
+    except (zipfile.BadZipFile, OSError, ValueError, RuntimeError):
+        return False
+
+
+def _is_header_encrypted_rar(archive_path: Path | str) -> bool:
+    """
+    O(1) 判别文件是否为加密文件头 (-hp) 的 RAR4 / RAR5 归档：
+    - RAR4: MAIN_HEAD (0x73) 的 MHD_PASSWORD 位 (0x0080) 置位；
+    - RAR5: 8 字节签名后首个块类型为 4 (Archive Encryption Header)。
+    """
+    try:
+        with open(archive_path, "rb") as f:
+            hdr = f.read(32)
+        if hdr.startswith(b"Rar!\x1a\x07\x00") and len(hdr) >= 14:
+            _crc, head_type, head_flags, _head_size = struct.unpack("<HBHH", hdr[7:14])
+            return head_type == 0x73 and bool(head_flags & 0x0080)
+        if hdr.startswith(b"Rar!\x1a\x07\x01\x00") and len(hdr) >= 14:
+            # 跳过 8B 签名 + 4B head_crc，解析 vint head_size 后读取首个 vint head_type
+            pos = 12
+            limit = min(len(hdr), pos + 10)
+            while pos < limit:
+                b = hdr[pos]
+                pos += 1
+                if not (b & 0x80):
+                    break
+            else:
+                return False
+            if pos >= len(hdr):
+                return False
+            head_type = 0
+            shift = 0
+            limit_t = min(len(hdr), pos + 10)
+            while pos < limit_t:
+                b = hdr[pos]
+                pos += 1
+                head_type |= (b & 0x7F) << shift
+                if not (b & 0x80):
+                    return head_type == 4
+                shift += 7
+    except (OSError, struct.error):
+        return False
+    return False
 
 
 class BaseEngine:
@@ -131,6 +244,20 @@ class BaseEngine:
         on_progress: Optional[Callable[[int], None]] = None,
     ) -> Path:
         raise NotImplementedError
+
+    def supports_repair_for(self, archive: str | Path) -> bool:
+        """当前引擎是否支持对目标归档执行独立修复提取（默认 True 以兼容旧版 Mock 引擎）。"""
+        return True
+
+    @staticmethod
+    def _is_embedded_polyglot(archive_path: Path) -> bool:
+        """检测文件是否为合法的偏移 > 0 内嵌图种（用于快速预检防误判）。"""
+        try:
+            from core.sandbox import detect_embedded_archive
+            emb_ext, emb_offset = detect_embedded_archive(archive_path)
+            return emb_ext is not None and emb_offset > 0
+        except Exception:
+            return False
 
     def repair_extract(
         self,
@@ -474,6 +601,17 @@ class BandizipEngine(BaseEngine):
 
     supports_fast_test: bool = True
 
+    def __init__(self, exe_path: str | Path):
+        raw_path = Path(exe_path)
+        if raw_path.name.lower() == "bandizip.exe" or raw_path.is_dir():
+            resolved = resolve_bandizip_cli(raw_path)
+            if resolved is None:
+                raise EngineNotFoundError(
+                    f"不能使用图形界面程序 Bandizip.exe，请指定命令行程序 bz.exe ({raw_path})"
+                )
+            exe_path = resolved
+        super().__init__(exe_path)
+
     _BZ_LIST_LINE_RE = re.compile(
         r"^\s*\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(\S+)\s+(\d+)\s+\d+\s+(.+?)\s*$"
     )
@@ -538,7 +676,16 @@ class BandizipEngine(BaseEngine):
                 probed = (None, True)
                 self._set_cached_probe(cache_key, probed)
                 return probed
-            # 非密码类错误（如坏包）已由 _classify_result 抛出 ExtractionFailedError
+            except ExtractionFailedError:
+                # 偏移图种在 l 列表探测失败时平滑降级为整包 t 验证，不误判为坏包
+                if self._is_embedded_polyglot(archive_path):
+                    logger.debug(
+                        f"Bandizip 列表探测遇图种偏移包 ({archive_path.name})，平滑降级为整包测试"
+                    )
+                    probed = (None, False)
+                    self._set_cached_probe(cache_key, probed)
+                    return probed
+                raise
 
         smallest = self._parse_smallest_member(result.stdout)
         probed = (smallest, False)
@@ -842,11 +989,23 @@ class WinRAREngine(BaseEngine):
             raise
 
         if result.returncode == 11:
-            probed = (None, True)
+            # 标准加密 ZIP 中央目录未加密，绝不误标为加密文件头（否则 lb 验密会假阳性）
+            if _is_encrypted_zip(archive_path):
+                probed = (None, False)
+            else:
+                probed = (None, True)
             self._set_cached_probe(cache_key, probed)
             return probed
 
         if result.returncode not in (0, 1):
+            if _is_encrypted_zip(archive_path) or self._is_embedded_polyglot(archive_path):
+                logger.debug(
+                    f"WinRAR 列表探测遇加密 ZIP/偏移图种 ({archive_path.name}, rc={result.returncode})，"
+                    f"平滑降级为整包测试"
+                )
+                probed = (None, False)
+                self._set_cached_probe(cache_key, probed)
+                return probed
             try:
                 self._classify_exit_code(
                     result, archive_str, pw_provided=False, password_used=""
@@ -1018,7 +1177,7 @@ class WinRAREngine(BaseEngine):
         """
         WinRAR 错误码精确分类，优先级高于文本解析。
         退出码：0=成功 1=警告 2=致命 3=CRC 5=写入 6=打开
-               7=命令行 8=内存 9=创建 10=无匹配 11=密码错误 255=中断
+               7=命令行 8=内存 9=创建 10=无匹配 11=密码错误 12=读错 13=坏包 255=中断
         """
         code = result.returncode
         if code == 11:
@@ -1035,12 +1194,34 @@ class WinRAREngine(BaseEngine):
                 "WinRAR 警告 (exit=%d): %s | %s",
                 code, archive_str, (result.stderr or result.stdout or ""))
             return
-        if code in (3, 5, 6, 7, 8, 9, 10, 255):
+        if code == 10 and _is_encrypted_zip(archive_str):
+            if pw_provided:
+                raise WrongPasswordError(
+                    archive_str,
+                    password_used,
+                    f"WinRAR exit code 10: 加密 ZIP 归档密码错误 | {result.stderr or result.stdout or ''}",
+                )
+            raise PasswordRequiredError(
+                archive_str,
+                f"WinRAR exit code 10: 加密 ZIP 归档需要密码 | {result.stderr or result.stdout or ''}",
+            )
+        if code in (3, 5, 6, 7, 8, 9, 10, 12, 13, 255):
             raise ExtractionFailedError(
                 archive_str, code,
                 f"WinRAR exit code {code}: {result.stderr or result.stdout or ''}")
 
         BaseEngine._classify_result(result, archive_str, pw_provided, password_used)
+
+    def supports_repair_for(self, archive: str | Path) -> bool:
+        """WinRAR r 仅支持修复 RAR/ZIP 归档，对 .7z 等格式直接跳过，避免长时间无效盲扫。"""
+        archive_path = Path(archive)
+        if archive_path.suffix.lower() in {".rar", ".zip"}:
+            return True
+        try:
+            from core.sandbox import detect_archive_type
+            return detect_archive_type(archive_path) in {".rar", ".zip"}
+        except Exception:
+            return False
 
     def repair_extract(
         self,
@@ -1057,6 +1238,11 @@ class WinRAREngine(BaseEngine):
         archive_str = str(archive_path)
         dest_str = str(Path(dest).resolve())
 
+        if not self.supports_repair_for(archive_path):
+            raise ExtractionFailedError(
+                archive_str, -1, "WinRAR 仅支持修复 RAR/ZIP 归档"
+            )
+
         # 在系统临时目录中执行修复，绝不污染用户源目录
         repaired_dir = Path(tempfile.mkdtemp(prefix="sb_repair_"))
         try:
@@ -1068,8 +1254,16 @@ class WinRAREngine(BaseEngine):
                 repair_cmd.insert(-2, f"-p{password}")
             else:
                 repair_cmd.insert(-2, "-p-")
+
+            # WinRAR r 无实时百分比输出：立即推送不确定态脉冲 (-1)，防止 UI 卡在 0%
+            if on_progress is not None:
+                try:
+                    on_progress(-1)
+                except Exception as cb_err:
+                    logger.debug(f"修复进度不确定态回调异常: {cb_err}")
+
             logger.info(f"WinRAR 执行修复: {repair_cmd}")
-            self._run_command(repair_cmd, timeout=min(timeout, 300), task_id=task_id)
+            repair_res = self._run_command(repair_cmd, timeout=min(timeout, 300), task_id=task_id)
 
             repaired_archive = None
             for f in repaired_dir.iterdir():
@@ -1078,14 +1272,28 @@ class WinRAREngine(BaseEngine):
                     break
 
             if repaired_archive is None:
-                logger.warning("WinRAR repair 未生成修复文件，降级为普通提取")
-                return self.extract(
+                if _is_header_encrypted_rar(archive_path):
+                    rc = repair_res.returncode if repair_res is not None else 11
+                    if password:
+                        raise WrongPasswordError(
+                            archive_str,
+                            password,
+                            f"WinRAR exit code 11 (repair rc={rc}): 加密文件头 RAR 密码错误",
+                        )
+                    raise PasswordRequiredError(
+                        archive_str,
+                        f"WinRAR exit code 11 (repair rc={rc}): 加密文件头 RAR 归档需要密码",
+                    )
+                if repair_res is not None and repair_res.returncode not in (0, 1):
+                    # 若 repair 本身因密码需求/密码错退出（如返回 11 或加密 ZIP 返回 10），保留精准密码分类
+                    self._classify_exit_code(
+                        repair_res, archive_str, bool(password), password or ""
+                    )
+                logger.warning("WinRAR repair 未生成修复文件，直接失败（不重复执行原包 extract）")
+                raise ExtractionFailedError(
                     archive_str,
-                    dest_str,
-                    password=password,
-                    timeout=timeout,
-                    task_id=task_id,
-                    on_progress=on_progress,
+                    repair_res.returncode if repair_res is not None else -1,
+                    "WinRAR repair 未生成修复文件",
                 )
 
             logger.info(f"WinRAR 修复文件: {repaired_archive}")
@@ -1144,6 +1352,9 @@ class SevenZipEngine(BaseEngine):
             "is not archive" in combined
             or "cannot open the file as" in combined
             or "can not open the file as" in combined
+            or "cannot open archive" in combined
+            or "can not open archive" in combined
+            or "headers error" in combined
         )
 
     @classmethod
@@ -1479,6 +1690,10 @@ class SevenZipEngine(BaseEngine):
         logger.info(f"7-Zip 解压完成: {archive_str} → {dest_str}")
         return dest_path
 
+    def supports_repair_for(self, archive: str | Path) -> bool:
+        """7-Zip x 原生具备容错能力，无需在链 ③ 重复执行相同命令。"""
+        return False
+
     def repair_extract(
         self,
         archive: str | Path,
@@ -1646,9 +1861,18 @@ def discover_engine(config=None) -> tuple[Optional[EngineType], Optional[str]]:
 
     for key in order:
         etype, manual_path, finder, label = engine_specs[key]
-        if manual_path and os.path.isfile(manual_path):
-            logger.info(f"使用用户配置的 {label} 路径: {manual_path}")
-            return etype, manual_path
+        if manual_path:
+            if key == "bandizip":
+                resolved_bz = resolve_bandizip_cli(manual_path)
+                if resolved_bz:
+                    logger.info(f"使用用户配置的 {label} CLI 路径: {resolved_bz}")
+                    return etype, resolved_bz
+                logger.warning(
+                    f"用户配置的 Bandizip 路径不可用或非命令行程序 (需要 bz.exe，已忽略并降级): {manual_path}"
+                )
+            elif os.path.isfile(manual_path):
+                logger.info(f"使用用户配置的 {label} 路径: {manual_path}")
+                return etype, manual_path
         found = finder()
         if found:
             return etype, found

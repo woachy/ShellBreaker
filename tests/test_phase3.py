@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,7 @@ import types
 import unittest
 import uuid
 import zipfile
+import zlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -565,20 +567,26 @@ class TestPhase3PolyglotMagicAndPipeline(_IsolatedConfigMixin, unittest.TestCase
         self.assertEqual(detect_embedded_archive(jpg_zip), (".zip", len(jpeg_prefix)))
         self.assertEqual(detect_archive_type(jpg_zip), ".zip")
 
-        # 2) PNG + RAR5
+        # 2) PNG + RAR5（合法 RAR5 Main 头 CRC32）
         png_prefix = b"\x89PNG\r\n\x1a\n" + b"\x22" * 200
-        rar5_magic = b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32
+        rar5_body = b"\x01\x00\x00"  # head_type=1 (Main), flags=0, archive_flags=0
+        rar5_size_vint = bytes([len(rar5_body)])
+        rar5_crc = zlib.crc32(rar5_size_vint + rar5_body) & 0xFFFFFFFF
+        rar5_magic = b"Rar!\x1a\x07\x01\x00" + struct.pack("<I", rar5_crc) + rar5_size_vint + rar5_body + b"\x00" * 16
         png_rar = self.scratch / "img_rar.png"
         png_rar.write_bytes(png_prefix + rar5_magic)
         self.assertEqual(detect_embedded_archive(png_rar), (".rar", len(png_prefix)))
         self.assertEqual(detect_archive_type(png_rar), ".rar")
 
-        # 3) 跨 1MB (1048576) 块边界的 7z 魔数
+        # 3) 跨 1MB (1048576) 块边界的合法 7z 32 字节 StartHeader
         boundary_offset = 1024 * 1024 - 2
         cross_7z = self.scratch / "cross_boundary.jpg"
+        next_hdr_info = struct.pack("<QQI", 0, 16, 0)
+        start_crc = zlib.crc32(next_hdr_info) & 0xFFFFFFFF
+        valid_7z_hdr = b"\x37\x7a\xbc\xaf\x27\x1c\x00\x04" + struct.pack("<I", start_crc) + next_hdr_info
         with open(cross_7z, "wb") as f:
             f.write(b"\xff\xd8\xff\xe0" + b"\x00" * (boundary_offset - 4))
-            f.write(b"\x37\x7a\xbc\xaf\x27\x1c" + b"\x00" * 64)
+            f.write(valid_7z_hdr + b"\x00" * 32)
         self.assertEqual(detect_embedded_archive(cross_7z), (".7z", boundary_offset))
 
         # 4) 纯真 MP4 含伪 PK\x03\x04 无 EOCD -> 绝不误报

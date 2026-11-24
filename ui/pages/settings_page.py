@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.engine import resolve_bandizip_cli
 from core.sandbox import SandboxManager
 from data.config_manager import ConfigManager
 from ui.theme.fonts import display_font
@@ -440,7 +441,12 @@ class SettingsPage(QWidget):
             out_idx = self.combo_output.findData(mode)
             self.combo_output.setCurrentIndex(out_idx if out_idx >= 0 else 0)
 
-            self.picker_bandizip.set_path(cfg.get("bandizip_path", ""))
+            bz_cfg = str(cfg.get("bandizip_path", "") or "").strip()
+            if bz_cfg and os.path.basename(bz_cfg).lower() == "bandizip.exe":
+                resolved_bz = resolve_bandizip_cli(bz_cfg)
+                if resolved_bz:
+                    bz_cfg = resolved_bz
+            self.picker_bandizip.set_path(bz_cfg)
             self.picker_winrar.set_path(cfg.get("winrar_path", ""))
             self.picker_sevenzip.set_path(cfg.get("sevenzip_path", ""))
             self.picker_custom.set_path(cfg.get("custom_output_path", ""))
@@ -537,10 +543,34 @@ class SettingsPage(QWidget):
     def _on_bandizip_path_changed(self, path: str):
         if self._is_loading:
             return
-        if path and not os.path.isfile(path):
-            self.row_bandizip.set_error("路径无效：找不到该文件")
-            self._set_status_invalid()
-            return
+        if path:
+            if not os.path.exists(path):
+                self.row_bandizip.set_error("路径无效：找不到该文件")
+                self._set_status_invalid()
+                return
+            is_gui_or_dir = (
+                os.path.basename(path).lower() == "bandizip.exe" or os.path.isdir(path)
+            )
+            resolved = resolve_bandizip_cli(path)
+            if resolved is None:
+                if is_gui_or_dir:
+                    self.row_bandizip.set_error(
+                        "不能使用图形界面程序 Bandizip.exe，请选择命令行程序 bz.exe"
+                    )
+                else:
+                    self.row_bandizip.set_error(
+                        "请选择 Bandizip 命令行程序 bz.exe（或 bc.exe）"
+                    )
+                self._set_status_invalid()
+                return
+            if is_gui_or_dir or resolved != path:
+                self.picker_bandizip.set_path(resolved)
+                self.row_bandizip.set_error("")
+                self._commit("bandizip_path", resolved)
+                if is_gui_or_dir:
+                    self._set_status("已自动切换为命令行程序 bz.exe", "saved")
+                    self._reset_status_timer.start()
+                return
         self.row_bandizip.set_error("")
         self._commit("bandizip_path", path)
 
@@ -702,9 +732,27 @@ class SettingsPage(QWidget):
         """写回全部控件当前值（无论是否 dirty）。校验失败时不写盘，不修改注册表。"""
         ok = True
         bz = self.picker_bandizip.path()
-        if bz and not os.path.isfile(bz):
-            self.row_bandizip.set_error("路径无效：找不到该文件")
-            ok = False
+        if bz:
+            if not os.path.exists(bz):
+                self.row_bandizip.set_error("路径无效：找不到该文件")
+                ok = False
+            else:
+                resolved_bz = resolve_bandizip_cli(bz)
+                if resolved_bz is None:
+                    if os.path.basename(bz).lower() == "bandizip.exe" or os.path.isdir(bz):
+                        self.row_bandizip.set_error(
+                            "不能使用图形界面程序 Bandizip.exe，请选择命令行程序 bz.exe"
+                        )
+                    else:
+                        self.row_bandizip.set_error(
+                            "请选择 Bandizip 命令行程序 bz.exe（或 bc.exe）"
+                        )
+                    ok = False
+                else:
+                    if resolved_bz != bz:
+                        self.picker_bandizip.set_path(resolved_bz)
+                        bz = resolved_bz
+                    self.row_bandizip.set_error("")
         else:
             self.row_bandizip.set_error("")
 

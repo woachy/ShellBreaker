@@ -22,12 +22,14 @@ from core.exceptions import (
 from core.sandbox import (
     SandboxManager,
     ensure_unique_path,
+    KNOWN_ARCHIVE_EXTS,
     PROTECTED_ENDPOINT_EXTS,
     POTENTIAL_DISGUISE_EXTS,
     ACCESSORY_EXTS,
     detect_archive_type,
     detect_embedded_archive,
     get_part_group,
+    is_primary_part,
     is_secondary_volume,
     send_to_recycle_bin,
     record_rename_journal,
@@ -107,7 +109,8 @@ class ExtractionPipeline:
         """上报实时单层百分比与累计有效解压次数（捕获回调异常，防中断主流程）。"""
         if self._on_layer_progress:
             try:
-                pct = max(0, min(100, int(current_percent)))
+                raw_pct = int(current_percent)
+                pct = min(100, raw_pct) if raw_pct >= 0 else raw_pct
                 self._on_layer_progress(task_id, pct, completed_count, status_text)
             except Exception as e:
                 logger.debug(f"[{task_id}] 层级进度回调异常: {e}")
@@ -123,11 +126,16 @@ class ExtractionPipeline:
     def _make_extract_progress_cb(self, task_id: str, archive_name: str) -> Callable[[int], None]:
         def _cb(pct: int) -> None:
             counters = self._get_counters(task_id)
+            text = (
+                f"正在处理: {archive_name} (进行中...)"
+                if pct < 0
+                else f"正在解压: {archive_name} ({pct}%)"
+            )
             self._notify_layer_progress(
                 task_id,
                 pct,
                 counters["total"],
-                f"正在解压: {archive_name} ({pct}%)",
+                text,
             )
         return _cb
 
@@ -214,6 +222,17 @@ class ExtractionPipeline:
                 archive_str, dest, password=password, task_id=task_id, on_progress=on_progress
             )
         return self._engine.extract(archive_str, dest, password=password, task_id=task_id)
+
+    def _engine_supports_repair(self, archive: Path) -> bool:
+        """检查当前引擎是否对目标归档支持独立修复提取（兼容未实现该方法的旧 Mock 引擎）。"""
+        checker = getattr(self._engine, "supports_repair_for", None)
+        if callable(checker):
+            try:
+                return bool(checker(archive))
+            except Exception as e:
+                logger.debug(f"检查引擎修复能力异常 ({archive}): {e}")
+                return True
+        return True
 
     def _engine_repair_extract(
         self,
@@ -401,14 +420,28 @@ class ExtractionPipeline:
             base_passwords = [r["password"] for r in self._pwd_mgr.get_all()]
             passwords, _ = self._merge_contextual_passwords(task_id, src_path, base_passwords)
 
-            # Step 3: 文件准备（铁律四：伪装包 shutil.copy 到沙箱并重命名为 .zip）
+            # Step 3: 文件准备（铁律四：伪装包硬链接/复制到沙箱并赋予探测后缀）
             self._check_aborted(task_id)
+            src_p = Path(src_path)
+            is_disguised_source = (
+                src_p.suffix.lower() not in KNOWN_ARCHIVE_EXTS
+                and not is_primary_part(src_p.name)
+                and not is_secondary_volume(src_p.name)
+            )
             actual_file = self._sandbox.prepare_file(src_path, sandbox_dir)
 
             # Step 4: 降维试错链
             self._check_aborted(task_id)
             dest_dir = str(sandbox_dir / "output")
-            self.fallback_extract(task_id, actual_file, dest_dir, passwords, cleanup_files, sandbox_dir)
+            self.fallback_extract(
+                task_id,
+                actual_file,
+                dest_dir,
+                passwords,
+                cleanup_files,
+                sandbox_dir,
+                is_disguised_source=is_disguised_source,
+            )
 
             # Step 4: 嵌套解压
             self._check_aborted(task_id)
@@ -507,13 +540,15 @@ class ExtractionPipeline:
         passwords: list[str],
         cleanup_files: list[Path],
         sandbox_dir: Path,
+        is_disguised_source: bool = False,
     ):
         """
         降维试错链：
         ① 原文件盲解
-        ② 若失败且非密码问题，改名 .zip 再试
-        ③ 若再失败且非密码问题，repair_extract
-        密码问题（PasswordRequiredError / WrongPasswordError）→ 立即中断，绝不进入改名/repair！
+        ② 若失败且非密码问题，改名 .zip 再试（同盘零拷贝硬链接优先，跨盘回退 copy2）
+        ③ 若再失败且非密码问题，且当前引擎支持修复目标格式，则执行 repair_extract
+        ④ 若检测到合法内嵌图种偏移 (0 < offset < file_size - 32)，剥离载体前缀再提取
+        密码问题（PasswordRequiredError / WrongPasswordError）→ 立即中断，绝不进入改名/repair/切片！
         """
         dest_path = Path(dest)
 
@@ -527,19 +562,27 @@ class ExtractionPipeline:
         if result == "password_issue":
             raise PasswordRequiredError(str(src), "密码验证失败于原文件盲解阶段")
 
-        # 链 ②：改名 .zip 再试（仅文件损坏时进入，跳过目录）
+        # 链 ②：改名 .zip 再试（伪装来源非 .zip 或未知后缀均应尝试；仅沙箱内临时硬链接，不伤原文件）
         ext = src.suffix.lower()
-        if ext in BLIND_EXTRACT_EXTS or not src.is_file():
+        should_try_zip_rename = (
+            src.is_file()
+            and ((ext not in BLIND_EXTRACT_EXTS) or (is_disguised_source and ext != ".zip"))
+        )
+        if not should_try_zip_rename:
             if not src.is_file():
-                logger.info(f"[{task_id}] 源路径是目录而非文件，直接进入修复链")
+                logger.info(f"[{task_id}] 源路径是目录而非文件，跳过改名 .zip 链")
             else:
-                logger.info(f"[{task_id}] 原文件已是合法后缀 ({ext})，直接进入修复链")
+                logger.info(f"[{task_id}] 原文件已是合法后缀 ({ext})，跳过改名 .zip 链")
         else:
             self._notify_progress(task_id, "盲解：改名 .zip 再试...")
-            renamed = sandbox_dir / (src.stem + "_renamed.zip")
-            shutil.copy(src, renamed)
+            renamed = ensure_unique_path(sandbox_dir / (src.stem + "_renamed.zip"))
+            try:
+                os.link(src, renamed)
+                logger.info(f"[{task_id}] 同盘硬链接改名 .zip → {renamed}")
+            except (OSError, AttributeError):
+                shutil.copy2(src, renamed)
+                logger.info(f"[{task_id}] 跨盘回退 copy2 改名 .zip → {renamed}")
             cleanup_files.append(renamed)
-            logger.info(f"[{task_id}] shutil.copy → {renamed}")
             result = self.try_extract_chain(task_id, renamed, dest, passwords, "改名.zip")
             if result == "success":
                 if dest_path.exists() and any(dest_path.iterdir()):
@@ -548,23 +591,31 @@ class ExtractionPipeline:
             if result == "password_issue":
                 raise PasswordRequiredError(str(src), "密码验证失败于改名.zip 阶段")
 
-        # 链 ③：repair_extract（仅文件损坏时进入）
-        self._notify_progress(task_id, "降维修复提取 (repair)...")
-        archive_to_repair = src if ext in BLIND_EXTRACT_EXTS else (
-            cleanup_files[-1] if cleanup_files else src
-        )
-        result = self.try_repair_chain(task_id, archive_to_repair, dest, passwords)
-        if result == "success":
-            if dest_path.exists() and any(dest_path.iterdir()):
-                self._record_valid_extraction(task_id)
-            return
-        if result == "password_issue":
-            raise PasswordRequiredError(str(src), "密码验证失败于 repair 阶段")
+        # 链 ③：repair_extract（仅文件损坏且当前引擎支持目标格式修复时进入）
+        archive_to_repair = cleanup_files[-1] if (should_try_zip_rename and cleanup_files) else src
+        if self._engine_supports_repair(archive_to_repair):
+            self._notify_progress(task_id, "降维修复提取 (repair)...")
+            result = self.try_repair_chain(task_id, archive_to_repair, dest, passwords)
+            if result == "success":
+                if dest_path.exists() and any(dest_path.iterdir()):
+                    self._record_valid_extraction(task_id)
+                return
+            if result == "password_issue":
+                raise PasswordRequiredError(str(src), "密码验证失败于 repair 阶段")
+        else:
+            logger.info(
+                f"[{task_id}] 当前引擎 ({self._engine_name or type(self._engine).__name__}) "
+                f"不对 {archive_to_repair.name} 执行独立修复，跳过链 ③"
+            )
 
-        # 链 ④：图种/复合伪装偏移剥离提取（仅当检测到偏移 > 0 的内嵌压缩包时触发）
+        # 链 ④：图种/复合伪装偏移剥离提取（仅当检测到合法偏移 0 < offset < file_size - 32 时触发）
         if src.is_file():
+            try:
+                src_size = src.stat().st_size
+            except OSError:
+                src_size = 0
             emb_ext, emb_offset = detect_embedded_archive(src)
-            if emb_ext is not None and emb_offset > 0:
+            if emb_ext is not None and 0 < emb_offset < src_size - 32:
                 self._notify_progress(task_id, f"图种偏移提取 ({emb_ext})...")
                 sliced = ensure_unique_path(sandbox_dir / (src.stem + "_embedded" + emb_ext))
                 try:
