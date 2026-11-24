@@ -25,13 +25,41 @@ jobs:
 
       - name: Install compression tools (WinRAR & Bandizip)
         run: |
-          choco install winrar -y --no-progress
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # Bandisoft uses a floating latest-release URL (dl.php?choco), so Chocolatey's
-          # manifest SHA256 drifts whenever Bandizip updates upstream.
-          choco install bandizip -y --no-progress --ignore-checksums
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Bandizip installation failed (exit=$LASTEXITCODE); continuing with WinRAR and bundled 7-Zip."
+          $ErrorActionPreference = "Stop"
+
+          # 1) WinRAR (official installer, fallback to Chocolatey)
+          $winrarExe = "C:\Program Files\WinRAR\WinRAR.exe"
+          if (-not (Test-Path $winrarExe)) {
+            $wrSetup = Join-Path $env:TEMP "winrar-x64-723.exe"
+            curl.exe -fsSL --retry 3 --connect-timeout 15 "https://www.rarlab.com/rar/winrar-x64-723.exe" -o $wrSetup
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $wrSetup)) {
+              Start-Process -FilePath $wrSetup -ArgumentList "/S" -Wait
+              Remove-Item $wrSetup -Force -ErrorAction SilentlyContinue
+            }
+          }
+          if (-not (Test-Path $winrarExe)) {
+            choco install winrar -y --no-progress
+          }
+          if (-not (Test-Path $winrarExe)) {
+            Write-Error "WinRAR installation failed: $winrarExe not found."
+            exit 1
+          }
+          Write-Host "Installed WinRAR: $winrarExe"
+
+          # 2) Bandizip (official installer avoids Chocolatey checksum drift on floating dl.php?choco)
+          $bzExe = "C:\Program Files\Bandizip\bz.exe"
+          if (-not (Test-Path $bzExe)) {
+            $bzSetup = Join-Path $env:TEMP "bandizipInstall.exe"
+            curl.exe -fsSL --retry 3 --connect-timeout 15 "https://www.bandisoft.com/bandizip/dl.php?choco" -o $bzSetup
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $bzSetup)) {
+              Start-Process -FilePath $bzSetup -ArgumentList "/S" -Wait
+              Remove-Item $bzSetup -Force -ErrorAction SilentlyContinue
+            }
+          }
+          if (-not (Test-Path $bzExe)) {
+            Write-Warning "Bandizip CLI ($bzExe) not found; continuing with WinRAR and bundled 7-Zip."
+          } else {
+            Write-Host "Installed Bandizip CLI: $bzExe"
           }
           $global:LASTEXITCODE = 0
         shell: pwsh

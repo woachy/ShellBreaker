@@ -479,7 +479,7 @@ class TestV121BandizipCliResolution(_IsolatedEnvMixin, unittest.TestCase):
              patch.object(engine_mod, "_find_winrar_cli", return_value=None):
             etype_deg, exe_deg = discover_engine(self.cfg)
         self.assertEqual(etype_deg, EngineType.SEVENZIP)
-        self.assertEqual(Path(exe_deg), fake_7z.resolve())
+        self.assertEqual(Path(exe_deg).resolve(), fake_7z.resolve())
 
         # 4) SettingsPage 离屏校验：选 Bandizip.exe 自动回填 bz.exe；无 bz.exe 拒存并报错
         self.cfg.set("bandizip_path", "")
